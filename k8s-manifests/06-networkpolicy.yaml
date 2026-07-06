@@ -1,0 +1,45 @@
+# NetworkPolicy: Allow ingress from cloudflare tunnel and internal traffic
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: open-design-policy
+  namespace: open-design
+spec:
+  podSelector:
+    matchLabels:
+      app: open-design
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - port: 7457
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 7457
+---
+# NetworkPolicy: Allow ingress to console (dashboard + ttyd)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: od-console-policy
+  namespace: open-design
+spec:
+  podSelector:
+    matchLabels:
+      app: od-console
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - port: 18790
+        - port: 7681
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 18790
+        - port: 7681

@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-design-svc
+  namespace: open-design
+  labels:
+    app: open-design
+    app.kubernetes.io/component: daemon
+    app.kubernetes.io/part-of: open-design
+spec:
+  selector:
+    app: open-design
+  ports:
+    - name: http
+      protocol: TCP
+      port: 7457
+      targetPort: 7457
+  type: ClusterIP

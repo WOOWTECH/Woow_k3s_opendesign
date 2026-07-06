@@ -1,0 +1,464 @@
+apiVersion: v1
+data:
+  app.py: |
+    #!/usr/bin/env python3
+    """Open Design Console — Flask management dashboard."""
+    import json
+    import os
+    import subprocess
+    import threading
+    import time
+    from datetime import datetime, timezone
+
+    from flask import Flask, jsonify, render_template, request
+
+    app = Flask(__name__)
+
+    NAMESPACE = os.environ.get("NAMESPACE", "open-design")
+    POD_LABEL = "app=open-design"
+    CONTAINER = "open-design"
+
+    # Health history
+    health_history = []
+    health_lock = threading.Lock()
+
+
+    def get_pod_name():
+        """Find the running open-design pod."""
+        try:
+            result = subprocess.run(
+                ["kubectl", "get", "pod", "-l", POD_LABEL, "-n", NAMESPACE,
+                 "--field-selector=status.phase=Running",
+                 "-o", "jsonpath={.items[0].metadata.name}"],
+                capture_output=True, text=True, timeout=10
+            )
+            return result.stdout.strip() or None
+        except Exception:
+            return None
+
+
+    def kexec(cmd):
+        """Execute command inside open-design pod, return stdout."""
+        pod = get_pod_name()
+        if not pod:
+            return None
+        try:
+            result = subprocess.run(
+                ["kubectl", "exec", pod, "-n", NAMESPACE, "-c", CONTAINER,
+                 "--", "sh", "-c", cmd],
+                capture_output=True, text=True, timeout=15
+            )
+            return result.stdout
+        except Exception:
+            return None
+
+
+    def health_check_loop():
+        """Background: check open-design health every 60s."""
+        time.sleep(15)
+        while True:
+            try:
+                pod = get_pod_name()
+                ts = datetime.now(timezone.utc).isoformat()
+                if pod:
+                    raw = kexec("curl -s http://localhost:7457/api/health 2>/dev/null")
+                    try:
+                        data = json.loads(raw) if raw else {}
+                        ok = data.get("ok", False)
+                    except Exception:
+                        ok = False
+                    entry = {"ts": ts, "pod": pod, "ok": ok}
+                else:
+                    entry = {"ts": ts, "pod": None, "ok": False}
+
+                with health_lock:
+                    health_history.append(entry)
+                    if len(health_history) > 100:
+                        health_history.pop(0)
+            except Exception:
+                pass
+            time.sleep(60)
+
+
+    # Start health check background thread
+    threading.Thread(target=health_check_loop, daemon=True).start()
+
+
+    @app.route("/")
+    def index():
+        return render_template("index.html")
+
+
+    @app.route("/api/status")
+    def api_status():
+        pod = get_pod_name()
+        if not pod:
+            return jsonify({"ok": False, "pod": None, "message": "Pod not found"})
+
+        health_raw = kexec("curl -s http://localhost:7457/api/health 2>/dev/null")
+        agents_raw = kexec("curl -s http://localhost:7457/api/agents 2>/dev/null")
+
+        health = {}
+        agents_available = []
+        try:
+            health = json.loads(health_raw) if health_raw else {}
+        except Exception:
+            pass
+        try:
+            agents_data = json.loads(agents_raw) if agents_raw else {}
+            for a in agents_data.get("agents", []):
+                if a.get("available"):
+                    agents_available.append({
+                        "id": a["id"],
+                        "name": a.get("name", a["id"]),
+                        "version": a.get("version", "unknown"),
+                        "path": a.get("path", ""),
+                    })
+        except Exception:
+            pass
+
+        return jsonify({
+            "ok": health.get("ok", False),
+            "pod": pod,
+            "version": health.get("version", "unknown"),
+            "agents": agents_available,
+            "namespace": NAMESPACE,
+        })
+
+
+    @app.route("/api/health-history")
+    def api_health_history():
+        with health_lock:
+            return jsonify(list(health_history))
+
+
+    @app.route("/api/agents")
+    def api_agents():
+        raw = kexec("curl -s http://localhost:7457/api/agents 2>/dev/null")
+        try:
+            data = json.loads(raw) if raw else {}
+            return jsonify(data)
+        except Exception:
+            return jsonify({"agents": [], "error": "Failed to fetch agents"})
+
+
+    @app.route("/api/logs")
+    def api_logs():
+        lines = request.args.get("lines", "100")
+        try:
+            result = subprocess.run(
+                ["kubectl", "logs", "--tail", str(lines),
+                 "-l", POD_LABEL, "-n", NAMESPACE, "-c", CONTAINER],
+                capture_output=True, text=True, timeout=15
+            )
+            return jsonify({"logs": result.stdout})
+        except Exception as e:
+            return jsonify({"logs": "", "error": str(e)})
+
+
+    @app.route("/api/restart", methods=["POST"])
+    def api_restart():
+        try:
+            result = subprocess.run(
+                ["kubectl", "rollout", "restart", "deployment/open-design",
+                 "-n", NAMESPACE],
+                capture_output=True, text=True, timeout=15
+            )
+            return jsonify({"ok": result.returncode == 0, "message": result.stdout})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)})
+
+
+    if __name__ == "__main__":
+        app.run(host="0.0.0.0", port=18790, debug=False)
+  connect.sh: |
+    #!/bin/sh
+    # ttyd wrapper: kubectl exec into the open-design daemon container
+
+    NAMESPACE="open-design"
+    LABEL="app=open-design"
+    CONTAINER="open-design"
+
+    while true; do
+      POD=$(kubectl get pod -l "$LABEL" -n "$NAMESPACE" \
+        --field-selector=status.phase=Running \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+      if [ -n "$POD" ]; then
+        echo ""
+        echo "╔══════════════════════════════════════════════════╗"
+        echo "║  Open Design Terminal — connected to: $POD"
+        echo "║  Type 'exit' to disconnect (auto-reconnects)    ║"
+        echo "╚══════════════════════════════════════════════════╝"
+        echo ""
+        kubectl exec -it "$POD" -n "$NAMESPACE" -c "$CONTAINER" -- /bin/bash
+        echo ""
+        echo "Session ended. Reconnecting in 2s..."
+        sleep 2
+      else
+        echo "Waiting for open-design pod to be ready..."
+        sleep 5
+      fi
+    done
+  entrypoint.py: |
+    #!/usr/bin/env python3
+    """Open Design Console — entrypoint that runs Flask + ttyd side by side."""
+    import subprocess
+    import os
+    import signal
+    import sys
+
+    TUI_PASSWORD = os.environ.get("TUI_PASSWORD", "changeme")
+
+    def main():
+        # ttyd: web terminal that kubectl-execs into open-design pod
+        ttyd_cmd = [
+            "ttyd", "-p", "7681",
+            "-c", f"admin:{TUI_PASSWORD}",
+            "-W",
+            "/app/connect.sh",
+        ]
+        ttyd_proc = subprocess.Popen(ttyd_cmd)
+        print(f"[entrypoint] ttyd started on :7681 (PID {ttyd_proc.pid})")
+
+        # Flask: management dashboard
+        flask_proc = subprocess.Popen(
+            [sys.executable, "/app/app.py"],
+            cwd="/app",
+        )
+        print(f"[entrypoint] Flask started on :18790 (PID {flask_proc.pid})")
+
+        def shutdown(sig, frame):
+            print(f"\n[entrypoint] Received signal {sig}, shutting down...")
+            ttyd_proc.terminate()
+            flask_proc.terminate()
+            sys.exit(0)
+
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+
+        # Wait for either to exit
+        pid, status = os.waitpid(-1, 0)
+        print(f"[entrypoint] Process {pid} exited with {status}, shutting down...")
+        ttyd_proc.terminate()
+        flask_proc.terminate()
+        sys.exit(1)
+
+    if __name__ == "__main__":
+        main()
+kind: ConfigMap
+metadata:
+  name: od-console-scripts
+  namespace: open-design
+---
+apiVersion: v1
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Open Design Console</title>
+    <style>
+      :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff; --green: #3fb950; --red: #f85149; --yellow: #d29922; }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+      .header { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; gap: 16px; }
+      .header h1 { font-size: 20px; font-weight: 600; }
+      .header .badge { font-size: 12px; padding: 2px 8px; border-radius: 12px; background: var(--green); color: #000; font-weight: 600; }
+      .header .badge.offline { background: var(--red); color: #fff; }
+      .tabs { display: flex; gap: 0; background: var(--card); border-bottom: 1px solid var(--border); padding: 0 24px; }
+      .tab { padding: 12px 20px; cursor: pointer; color: var(--dim); border-bottom: 2px solid transparent; font-size: 14px; font-weight: 500; transition: all 0.2s; }
+      .tab:hover { color: var(--text); }
+      .tab.active { color: var(--text); border-bottom-color: var(--accent); }
+      .content { padding: 24px; max-width: 1200px; margin: 0 auto; }
+      .panel { display: none; }
+      .panel.active { display: block; }
+      .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+      .card h3 { font-size: 14px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; }
+      .stat { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+      .stat .label { color: var(--dim); min-width: 120px; font-size: 14px; }
+      .stat .value { font-weight: 500; font-size: 14px; }
+      .stat .dot { width: 8px; height: 8px; border-radius: 50%; }
+      .dot.green { background: var(--green); }
+      .dot.red { background: var(--red); }
+      .dot.yellow { background: var(--yellow); }
+      .agents-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+      .agent-card { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 14px; }
+      .agent-card .name { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
+      .agent-card .version { color: var(--dim); font-size: 13px; }
+      .agent-card .path { color: var(--dim); font-size: 12px; font-family: monospace; margin-top: 6px; word-break: break-all; }
+      .terminal-frame { width: 100%; height: calc(100vh - 160px); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+      .terminal-frame iframe { width: 100%; height: 100%; border: none; }
+      .logs-box { background: #000; color: #0f0; font-family: 'Courier New', monospace; font-size: 13px; padding: 16px; border-radius: 8px; white-space: pre-wrap; word-break: break-all; max-height: calc(100vh - 240px); overflow-y: auto; line-height: 1.5; }
+      .toolbar { display: flex; gap: 8px; margin-bottom: 16px; align-items: center; }
+      .btn { padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.2s; }
+      .btn:hover { border-color: var(--accent); }
+      .btn.danger { border-color: var(--red); color: var(--red); }
+      .btn.danger:hover { background: var(--red); color: #fff; }
+      .refresh-indicator { color: var(--dim); font-size: 12px; margin-left: auto; }
+    </style>
+    </head>
+    <body>
+
+    <div class="header">
+      <h1>Open Design Console</h1>
+      <span class="badge" id="statusBadge">Loading...</span>
+    </div>
+
+    <div class="tabs">
+      <div class="tab active" onclick="switchTab('dashboard')">Dashboard</div>
+      <div class="tab" onclick="switchTab('terminal')">Terminal</div>
+      <div class="tab" onclick="switchTab('logs')">Logs</div>
+    </div>
+
+    <div class="content">
+      <!-- Dashboard Panel -->
+      <div class="panel active" id="panel-dashboard">
+        <div class="card">
+          <h3>System Status</h3>
+          <div class="stat"><span class="label">Status</span><span class="dot" id="healthDot"></span><span class="value" id="healthText">--</span></div>
+          <div class="stat"><span class="label">Pod</span><span class="value" id="podName">--</span></div>
+          <div class="stat"><span class="label">Version</span><span class="value" id="appVersion">--</span></div>
+          <div class="stat"><span class="label">Namespace</span><span class="value" id="nsName">--</span></div>
+        </div>
+
+        <div class="card">
+          <h3>Available Agent CLIs</h3>
+          <div class="agents-grid" id="agentsGrid">
+            <div style="color: var(--dim)">Loading...</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Actions</h3>
+          <div class="toolbar">
+            <button class="btn" onclick="refreshStatus()">Refresh Status</button>
+            <button class="btn danger" onclick="restartDaemon()">Restart Daemon</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Terminal Panel -->
+      <div class="panel" id="panel-terminal">
+        <div class="terminal-frame">
+          <iframe id="ttydFrame" src="about:blank"></iframe>
+        </div>
+      </div>
+
+      <!-- Logs Panel -->
+      <div class="panel" id="panel-logs">
+        <div class="toolbar">
+          <button class="btn" onclick="refreshLogs()">Refresh</button>
+          <select id="logLines" class="btn" onchange="refreshLogs()">
+            <option value="50">50 lines</option>
+            <option value="100" selected>100 lines</option>
+            <option value="300">300 lines</option>
+            <option value="500">500 lines</option>
+          </select>
+          <span class="refresh-indicator" id="logsTime"></span>
+        </div>
+        <div class="logs-box" id="logsBox">Loading logs...</div>
+      </div>
+    </div>
+
+    <script>
+    const TTYD_PORT = 7681;
+
+    function switchTab(name) {
+      document.querySelectorAll('.tab').forEach((t, i) => {
+        t.classList.toggle('active', ['dashboard','terminal','logs'][i] === name);
+      });
+      document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+      document.getElementById('panel-' + name).classList.add('active');
+
+      if (name === 'terminal') {
+        const frame = document.getElementById('ttydFrame');
+        if (frame.src === 'about:blank') {
+          // Use same host but ttyd port
+          const loc = window.location;
+          frame.src = loc.protocol + '//' + loc.hostname + ':' + TTYD_PORT;
+        }
+      }
+      if (name === 'logs') refreshLogs();
+    }
+
+    async function refreshStatus() {
+      try {
+        const r = await fetch('/api/status');
+        const d = await r.json();
+        const badge = document.getElementById('statusBadge');
+        const dot = document.getElementById('healthDot');
+        const text = document.getElementById('healthText');
+
+        if (d.ok) {
+          badge.textContent = 'Online';
+          badge.className = 'badge';
+          dot.className = 'dot green';
+          text.textContent = 'Healthy';
+        } else {
+          badge.textContent = 'Offline';
+          badge.className = 'badge offline';
+          dot.className = 'dot red';
+          text.textContent = d.message || 'Unhealthy';
+        }
+        document.getElementById('podName').textContent = d.pod || '--';
+        document.getElementById('appVersion').textContent = d.version || '--';
+        document.getElementById('nsName').textContent = d.namespace || '--';
+
+        const grid = document.getElementById('agentsGrid');
+        if (d.agents && d.agents.length > 0) {
+          grid.innerHTML = d.agents.map(a => `
+            <div class="agent-card">
+              <div class="name">${a.name}</div>
+              <div class="version">v${a.version}</div>
+              <div class="path">${a.path}</div>
+            </div>
+          `).join('');
+        } else {
+          grid.innerHTML = '<div style="color: var(--dim)">No agents detected</div>';
+        }
+      } catch (e) {
+        document.getElementById('statusBadge').textContent = 'Error';
+        document.getElementById('statusBadge').className = 'badge offline';
+      }
+    }
+
+    async function refreshLogs() {
+      const lines = document.getElementById('logLines').value;
+      try {
+        const r = await fetch('/api/logs?lines=' + lines);
+        const d = await r.json();
+        document.getElementById('logsBox').textContent = d.logs || '(no logs)';
+        document.getElementById('logsTime').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+        const box = document.getElementById('logsBox');
+        box.scrollTop = box.scrollHeight;
+      } catch (e) {
+        document.getElementById('logsBox').textContent = 'Failed to fetch logs: ' + e.message;
+      }
+    }
+
+    async function restartDaemon() {
+      if (!confirm('Restart the open-design daemon? Active sessions will be interrupted.')) return;
+      try {
+        const r = await fetch('/api/restart', { method: 'POST' });
+        const d = await r.json();
+        alert(d.ok ? 'Restart initiated' : 'Restart failed: ' + (d.error || d.message));
+        setTimeout(refreshStatus, 10000);
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+    }
+
+    // Auto-refresh status every 30s
+    refreshStatus();
+    setInterval(refreshStatus, 30000);
+    </script>
+
+    </body>
+    </html>
+kind: ConfigMap
+metadata:
+  name: od-console-html
+  namespace: open-design

@@ -1,0 +1,128 @@
+# Open Design Console — web dashboard + ttyd terminal
+# Pattern: python:3.9-slim base + runtime tool install + ConfigMap app injection
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: od-console
+  namespace: open-design
+  labels:
+    app: od-console
+    app.kubernetes.io/component: console
+    app.kubernetes.io/part-of: open-design
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: od-console
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: od-console
+    spec:
+      serviceAccountName: od-console-sa
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: console
+          image: python:3.9-slim
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "[init] Installing system packages..."
+              apt-get update -qq && apt-get install -y -qq curl ca-certificates > /dev/null 2>&1
+
+              echo "[init] Installing ttyd..."
+              curl -sLo /usr/local/bin/ttyd \
+                https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64
+              chmod +x /usr/local/bin/ttyd
+
+              echo "[init] Installing kubectl..."
+              KUBECTL_VER=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sLo /usr/local/bin/kubectl \
+                "https://dl.k8s.io/release/${KUBECTL_VER}/bin/linux/amd64/kubectl"
+              chmod +x /usr/local/bin/kubectl
+
+              echo "[init] Installing Python dependencies..."
+              pip install -q flask==3.1.0 requests==2.32.3 > /dev/null 2>&1
+
+              echo "[init] Setting up app..."
+              mkdir -p /app/templates
+              cp /mnt/scripts/app.py /app/app.py
+              cp /mnt/scripts/entrypoint.py /app/entrypoint.py
+              cp /mnt/scripts/connect.sh /app/connect.sh
+              cp /mnt/html/index.html /app/templates/index.html
+              chmod +x /app/connect.sh
+
+              echo "[init] Starting console services..."
+              exec python /app/entrypoint.py
+          ports:
+            - containerPort: 18790
+              name: http
+            - containerPort: 7681
+              name: ttyd
+          env:
+            - name: NAMESPACE
+              value: "open-design"
+            - name: TUI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: od-secrets
+                  key: TUI_PASSWORD
+          volumeMounts:
+            - name: scripts
+              mountPath: /mnt/scripts
+            - name: html
+              mountPath: /mnt/html
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            tcpSocket:
+              port: 18790
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            tcpSocket:
+              port: 18790
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: scripts
+          configMap:
+            name: od-console-scripts
+            defaultMode: 0755
+        - name: html
+          configMap:
+            name: od-console-html
+            defaultMode: 0644
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: od-console-svc
+  namespace: open-design
+  labels:
+    app: od-console
+    app.kubernetes.io/part-of: open-design
+spec:
+  selector:
+    app: od-console
+  ports:
+    - name: http
+      protocol: TCP
+      port: 18790
+      targetPort: 18790
+    - name: ttyd
+      protocol: TCP
+      port: 7681
+      targetPort: 7681
+  type: ClusterIP

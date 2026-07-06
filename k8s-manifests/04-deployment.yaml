@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-design
+  namespace: open-design
+  labels:
+    app: open-design
+    app.kubernetes.io/component: daemon
+    app.kubernetes.io/part-of: open-design
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: open-design
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: open-design
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: "woowtechcluster1-aorus-15p-xd"
+      securityContext:
+        fsGroup: 1001
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: open-design
+          image: localhost/open-design:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 7457
+              name: http
+          envFrom:
+            - configMapRef:
+                name: od-config
+          volumeMounts:
+            - name: od-data
+              mountPath: /app/.od
+            - name: od-home
+              mountPath: /home/opendesign
+          resources:
+            requests:
+              cpu: 1000m
+              memory: 2Gi
+            limits:
+              cpu: 4000m
+              memory: 8Gi
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 7457
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 7457
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: od-data
+          persistentVolumeClaim:
+            claimName: open-design-data-pvc
+        - name: od-home
+          persistentVolumeClaim:
+            claimName: open-design-home-pvc

@@ -1,0 +1,85 @@
+# =============================================================
+# Open Design — Custom Image with Agent CLIs
+#
+# Multi-stage build:
+#   Stage 1: Clone & build open-design from source
+#   Stage 2: Runtime with opencode + Claude Code pre-installed
+#
+# Build: docker build -t open-design:latest -f Dockerfile.open-design .
+# =============================================================
+
+# ── Stage 1: Build open-design from source ──────────────────────
+FROM node:24-slim AS builder
+
+ENV CI=true
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 make g++ git ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Clone the repository
+RUN git clone --depth 1 https://github.com/nexu-io/open-design.git .
+
+# Enable corepack and install dependencies
+RUN corepack enable \
+    && corepack pnpm install --frozen-lockfile \
+    || corepack pnpm install
+
+# Build web UI (static export to apps/web/out) and daemon
+RUN corepack pnpm --filter @open-design/web build \
+    && corepack pnpm --filter @open-design/daemon build 2>/dev/null || true
+
+# ── Stage 2: Runtime with agent CLIs ───────────────────────────
+FROM node:24-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tini git curl bash ca-certificates \
+        poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd -g 1001 opendesign \
+    && useradd -u 1001 -g opendesign -m -s /bin/bash opendesign
+
+# ── Install Claude Code (official npm global install) ───────────
+# This provides the `claude` command globally
+RUN npm install -g @anthropic-ai/claude-code \
+    && claude --version || echo "Claude Code installed (version check may need API key)"
+
+# ── Install opencode (official installer) ───────────────────────
+# The installer puts binary at ~/.opencode/bin/opencode
+# We install as root then copy to /usr/local/bin for global access
+RUN curl -fsSL https://opencode.ai/install | HOME=/root bash \
+    && cp /root/.opencode/bin/opencode /usr/local/bin/opencode \
+    && chmod +x /usr/local/bin/opencode \
+    && opencode version || echo "opencode installed"
+
+# Also install for the opendesign user (some tools check $HOME/.opencode)
+RUN mkdir -p /home/opendesign/.opencode/bin \
+    && cp /usr/local/bin/opencode /home/opendesign/.opencode/bin/opencode \
+    && chown -R opendesign:opendesign /home/opendesign/.opencode
+
+# ── Copy built open-design from builder ─────────────────────────
+WORKDIR /app
+COPY --from=builder --chown=opendesign:opendesign /app /app
+
+# Create data directory
+RUN mkdir -p /app/.od && chown -R opendesign:opendesign /app/.od
+
+# ── Environment ─────────────────────────────────────────────────
+ENV NODE_ENV=production
+ENV NODE_OPTIONS=--max-old-space-size=4096
+ENV OD_BIND_HOST=0.0.0.0
+ENV OD_PORT=7457
+ENV HOME=/home/opendesign
+ENV PATH="/home/opendesign/.opencode/bin:/usr/local/bin:$PATH"
+
+EXPOSE 7457
+
+USER opendesign
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "apps/daemon/bin/od.mjs", "--host", "0.0.0.0", "--port", "7457", "--no-open"]

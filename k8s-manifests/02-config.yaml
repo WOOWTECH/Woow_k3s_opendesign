@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: od-config
+  namespace: open-design
+  labels:
+    app: open-design
+    app.kubernetes.io/part-of: open-design
+data:
+  OD_ALLOWED_ORIGINS: "https://open-design.woowtech.io"
+  OD_PORT: "7457"
+  OD_BIND_HOST: "0.0.0.0"
+  # Auth handled by Cloudflare Tunnel — disable daemon-level API auth
+  OD_DISABLE_API_AUTH: "1"
