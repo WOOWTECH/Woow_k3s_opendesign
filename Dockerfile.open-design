@@ -32,32 +32,61 @@ RUN corepack enable \
 RUN corepack pnpm --filter @open-design/web build \
     && corepack pnpm --filter @open-design/daemon build 2>/dev/null || true
 
-# ── Stage 2: Runtime with agent CLIs ───────────────────────────
+# ── Stage 2: Runtime with agent CLIs + full design toolchain ───
 FROM node:24-slim
 
+# ── System packages ────────────────────────────────────────────
+# P0: fonts (CJK/emoji), ffmpeg, python3
+# P1: image tools (ghostscript, pngquant, libvips), ripgrep, tmux
+# P2: audio (sox), document utils
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        tini git curl bash ca-certificates \
-        poppler-utils \
+        tini git curl bash ca-certificates gnupg \
+        poppler-utils ghostscript pngquant \
+        python3 python3-venv python3-pip \
+        ffmpeg sox libsox-fmt-all \
+        ripgrep tmux jq unzip wget \
+        libvips-dev \
+        fontconfig fonts-noto-core fonts-noto-cjk fonts-noto-color-emoji \
+    && fc-cache -fv \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
 RUN groupadd -g 1001 opendesign \
     && useradd -u 1001 -g opendesign -m -s /bin/bash opendesign
 
+# ── uv (fast Python package manager) ──────────────────────────
+RUN curl -fsSL "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz" \
+        | tar xz -C /tmp \
+    && cp /tmp/uv-x86_64-unknown-linux-gnu/uv /usr/local/bin/uv \
+    && cp /tmp/uv-x86_64-unknown-linux-gnu/uvx /usr/local/bin/uvx \
+    && chmod +x /usr/local/bin/uv /usr/local/bin/uvx \
+    && rm -rf /tmp/uv-*
+
+# ── npm global tools (design-related) ─────────────────────────
+RUN npm install -g svgo @mermaid-js/mermaid-cli sharp-cli 2>/dev/null || true
+
 # ── Install Claude Code (official npm global install) ───────────
-# This provides the `claude` command globally
 RUN npm install -g @anthropic-ai/claude-code \
-    && claude --version || echo "Claude Code installed (version check may need API key)"
+    && claude --version || echo "Claude Code installed"
 
 # ── Install opencode (official installer) ───────────────────────
-# The installer puts binary at ~/.opencode/bin/opencode
-# We install as root then copy to /usr/local/bin for global access
 RUN curl -fsSL https://opencode.ai/install | HOME=/root bash \
     && cp /root/.opencode/bin/opencode /usr/local/bin/opencode \
     && chmod +x /usr/local/bin/opencode \
     && opencode version || echo "opencode installed"
 
-# Also install for the opendesign user (some tools check $HOME/.opencode)
+# ── Python venv with design & AI packages ─────────────────────
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir \
+        ddgs anthropic openai httpx requests aiohttp websockets \
+        pillow lxml rich Jinja2 Markdown PyYAML click \
+        playwright \
+    && /opt/venv/bin/playwright install --with-deps chromium \
+    && for bin in ddgs playwright; do \
+        ln -sf /opt/venv/bin/$bin /usr/local/bin/$bin; \
+    done
+
+# ── Setup opendesign user paths ────────────────────────────────
 RUN mkdir -p /home/opendesign/.opencode/bin \
     && cp /usr/local/bin/opencode /home/opendesign/.opencode/bin/opencode \
     && chown -R opendesign:opendesign /home/opendesign/.opencode
@@ -75,7 +104,8 @@ ENV NODE_OPTIONS=--max-old-space-size=4096
 ENV OD_BIND_HOST=0.0.0.0
 ENV OD_PORT=7457
 ENV HOME=/home/opendesign
-ENV PATH="/home/opendesign/.opencode/bin:/usr/local/bin:$PATH"
+ENV PATH="/opt/venv/bin:/home/opendesign/.opencode/bin:/usr/local/bin:$PATH"
+ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true
 
 EXPOSE 7457
 
