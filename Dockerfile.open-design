@@ -76,12 +76,14 @@ RUN curl -fsSL https://opencode.ai/install | HOME=/root bash \
     && opencode version || echo "opencode installed"
 
 # ── Python venv with design & AI packages ─────────────────────
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir \
         ddgs anthropic openai httpx requests aiohttp websockets \
         pillow lxml rich Jinja2 Markdown PyYAML click \
         playwright \
-    && /opt/venv/bin/playwright install --with-deps chromium \
+    && PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers /opt/venv/bin/playwright install --with-deps chromium \
+    && chmod -R 755 /opt/pw-browsers \
     && for bin in ddgs playwright; do \
         ln -sf /opt/venv/bin/$bin /usr/local/bin/$bin; \
     done
