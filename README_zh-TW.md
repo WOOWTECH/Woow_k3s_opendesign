@@ -77,9 +77,9 @@ graph TB
     end
 
     User -->|HTTPS| CF
-    CF -->|open-design.woowtech.io| SVC1
-    CF -->|open-design-tui.woowtech.io| SVC2
-    CF -->|open-design-term.woowtech.io| SVC2
+    CF -->|open-design.your-domain.io| SVC1
+    CF -->|open-design-tui.your-domain.io| SVC2
+    CF -->|open-design-term.your-domain.io| SVC2
     SVC1 --> OD
     SVC2 --> FLASK
     SVC2 --> TTYD
@@ -266,11 +266,11 @@ claude
 
 | 服務 | 網址 | 說明 |
 |------|------|------|
-| Open Design UI | `https://open-design.woowtech.io` | 主要設計介面 |
-| 控制台儀表板 | `https://open-design-tui.woowtech.io` | Flask 狀態儀表板 |
-| Web 終端機 | `https://open-design-term.woowtech.io` | ttyd 瀏覽器終端機 |
-| 健康檢查 | `https://open-design.woowtech.io/api/health` | `{"ok":true,"version":"0.12.1"}` |
-| 代理 API | `https://open-design.woowtech.io/api/agents` | 列出偵測到的代理 CLI |
+| Open Design UI | `https://open-design.your-domain.io` | 主要設計介面 |
+| 控制台儀表板 | `https://open-design-tui.your-domain.io` | Flask 狀態儀表板 |
+| Web 終端機 | `https://open-design-term.your-domain.io` | ttyd 瀏覽器終端機 |
+| 健康檢查 | `https://open-design.your-domain.io/api/health` | `{"ok":true,"version":"0.12.1"}` |
+| 代理 API | `https://open-design.your-domain.io/api/agents` | 列出偵測到的代理 CLI |
 
 ## 支援
 

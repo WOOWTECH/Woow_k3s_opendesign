@@ -20,7 +20,7 @@ spec:
         app: open-design
     spec:
       nodeSelector:
-        kubernetes.io/hostname: "woowtechcluster1-aorus-15p-xd"
+        kubernetes.io/hostname: "__K3S_NODE_HOSTNAME__"
       securityContext:
         fsGroup: 1001
       terminationGracePeriodSeconds: 30

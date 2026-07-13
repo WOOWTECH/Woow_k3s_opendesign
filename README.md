@@ -77,9 +77,9 @@ graph TB
     end
 
     User -->|HTTPS| CF
-    CF -->|open-design.woowtech.io| SVC1
-    CF -->|open-design-tui.woowtech.io| SVC2
-    CF -->|open-design-term.woowtech.io| SVC2
+    CF -->|open-design.your-domain.io| SVC1
+    CF -->|open-design-tui.your-domain.io| SVC2
+    CF -->|open-design-term.your-domain.io| SVC2
     SVC1 --> OD
     SVC2 --> FLASK
     SVC2 --> TTYD
@@ -307,11 +307,11 @@ The multi-stage Dockerfile (`Dockerfile.open-design`) builds:
 
 | Service | URL | Description |
 |---------|-----|-------------|
-| Open Design UI | `https://open-design.woowtech.io` | Main design interface |
-| Console Dashboard | `https://open-design-tui.woowtech.io` | Flask status dashboard |
-| Web Terminal | `https://open-design-term.woowtech.io` | ttyd browser terminal |
-| Health Check | `https://open-design.woowtech.io/api/health` | `{"ok":true,"version":"0.12.1"}` |
-| Agents API | `https://open-design.woowtech.io/api/agents` | List detected agent CLIs |
+| Open Design UI | `https://open-design.your-domain.io` | Main design interface |
+| Console Dashboard | `https://open-design-tui.your-domain.io` | Flask status dashboard |
+| Web Terminal | `https://open-design-term.your-domain.io` | ttyd browser terminal |
+| Health Check | `https://open-design.your-domain.io/api/health` | `{"ok":true,"version":"0.12.1"}` |
+| Agents API | `https://open-design.your-domain.io/api/agents` | List detected agent CLIs |
 
 ## Support
 
