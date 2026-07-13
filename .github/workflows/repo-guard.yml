@@ -1,0 +1,52 @@
+# =============================================================================
+# repo-guard.yml — 倉庫污染防護 CI (OpenDesign)
+# =============================================================================
+# Checks for OpenClaw or Hermes files that don't belong in this repo.
+
+name: Repo Guard — Anti-Pollution Check
+
+on:
+  push:
+    branches: [main, k3s]
+  pull_request:
+    branches: [main, k3s]
+
+jobs:
+  check-pollution:
+    name: Check for cross-repo pollution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan for cross-repo pollution markers
+        run: |
+          echo "🔍 Scanning for cross-repo pollution markers..."
+          FOUND=0
+
+          for dir in openclaw-k3s-paas openclaw-console setup-wizard hermes; do
+            if [ -d "$dir" ]; then
+              echo "❌ POLLUTION: directory '$dir/' does not belong in OpenDesign"
+              FOUND=1
+            fi
+          done
+
+          for file in Dockerfile.nerve Dockerfile.custom Dockerfile.hermes-agent; do
+            if [ -f "$file" ]; then
+              echo "❌ POLLUTION: file '$file' does not belong in OpenDesign"
+              FOUND=1
+            fi
+          done
+
+          FOREIGN=$(find . -maxdepth 3 \( -name "*openclaw*" -o -name "*hermes*" \) -not -path "./.git/*" -not -name "*.md" 2>/dev/null)
+          if [ -n "$FOREIGN" ]; then
+            echo "❌ POLLUTION: foreign files detected:"
+            echo "$FOREIGN" | sed 's/^/    /'
+            FOUND=1
+          fi
+
+          if [ "$FOUND" -eq 1 ]; then
+            echo "⛔ Cross-repo pollution detected. Push blocked."
+            exit 1
+          fi
+
+          echo "✅ No cross-repo pollution detected."
