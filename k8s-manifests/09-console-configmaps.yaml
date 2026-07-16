@@ -22,9 +22,30 @@ data:
     health_history = []
     health_lock = threading.Lock()
 
+    # Response cache for expensive kubectl+curl calls
+    _cache = {}
+    _cache_lock = threading.Lock()
+    CACHE_TTL = 15  # seconds
+
+
+    def _cache_get(key):
+        with _cache_lock:
+            entry = _cache.get(key)
+            if entry and time.time() - entry["ts"] < CACHE_TTL:
+                return entry["val"]
+        return None
+
+
+    def _cache_set(key, val):
+        with _cache_lock:
+            _cache[key] = {"val": val, "ts": time.time()}
+
 
     def get_pod_name():
-        """Find the running open-design pod."""
+        """Find the running open-design pod (cached)."""
+        cached = _cache_get("pod_name")
+        if cached is not None:
+            return cached
         try:
             result = subprocess.run(
                 ["kubectl", "get", "pod", "-l", POD_LABEL, "-n", NAMESPACE,
@@ -32,7 +53,10 @@ data:
                  "-o", "jsonpath={.items[0].metadata.name}"],
                 capture_output=True, text=True, timeout=10
             )
-            return result.stdout.strip() or None
+            pod = result.stdout.strip() or None
+            if pod:
+                _cache_set("pod_name", pod)
+            return pod
         except Exception:
             return None
 
@@ -89,33 +113,37 @@ data:
         return render_template("index.html")
 
 
+    def _fetch_health_data():
+        """Fetch health data with caching."""
+        cached = _cache_get("health_data")
+        if cached is not None:
+            return cached
+        raw = kexec("curl -s http://localhost:7457/api/health 2>/dev/null")
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        _cache_set("health_data", data)
+        return data
+
+
     @app.route("/api/status")
     def api_status():
         pod = get_pod_name()
         if not pod:
             return jsonify({"ok": False, "pod": None, "message": "Pod not found"})
 
-        health_raw = kexec("curl -s http://localhost:7457/api/health 2>/dev/null")
-        agents_raw = kexec("curl -s http://localhost:7457/api/agents 2>/dev/null")
-
-        health = {}
+        health = _fetch_health_data()
+        agents_data = _fetch_agents_data()
         agents_available = []
-        try:
-            health = json.loads(health_raw) if health_raw else {}
-        except Exception:
-            pass
-        try:
-            agents_data = json.loads(agents_raw) if agents_raw else {}
-            for a in agents_data.get("agents", []):
-                if a.get("available"):
-                    agents_available.append({
-                        "id": a["id"],
-                        "name": a.get("name", a["id"]),
-                        "version": a.get("version", "unknown"),
-                        "path": a.get("path", ""),
-                    })
-        except Exception:
-            pass
+        for a in agents_data.get("agents", []):
+            if a.get("available"):
+                agents_available.append({
+                    "id": a["id"],
+                    "name": a.get("name", a["id"]),
+                    "version": a.get("version", "unknown"),
+                    "path": a.get("path", ""),
+                })
 
         return jsonify({
             "ok": health.get("ok", False),
@@ -132,19 +160,38 @@ data:
             return jsonify(list(health_history))
 
 
-    @app.route("/api/agents")
-    def api_agents():
+    def _fetch_agents_data():
+        """Fetch agents data with caching."""
+        cached = _cache_get("agents_data")
+        if cached is not None:
+            return cached
         raw = kexec("curl -s http://localhost:7457/api/agents 2>/dev/null")
         try:
             data = json.loads(raw) if raw else {}
-            return jsonify(data)
         except Exception:
-            return jsonify({"agents": [], "error": "Failed to fetch agents"})
+            data = {}
+        _cache_set("agents_data", data)
+        return data
+
+
+    @app.route("/api/agents")
+    def api_agents():
+        data = _fetch_agents_data()
+        if data:
+            return jsonify(data)
+        return jsonify({"agents": [], "error": "Failed to fetch agents"})
 
 
     @app.route("/api/logs")
     def api_logs():
-        lines = request.args.get("lines", "100")
+        lines_param = request.args.get("lines", "100")
+        try:
+            lines = int(lines_param)
+            if lines < 1:
+                return jsonify({"error": "lines must be a positive integer"}), 400
+            lines = min(lines, 10000)  # cap at 10k
+        except (ValueError, TypeError):
+            return jsonify({"error": "lines must be a valid integer"}), 400
         try:
             result = subprocess.run(
                 ["kubectl", "logs", "--tail", str(lines),
