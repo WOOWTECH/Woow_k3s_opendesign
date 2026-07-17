@@ -43,3 +43,27 @@ spec:
       ports:
         - port: 18790
         - port: 7681
+---
+# NetworkPolicy: Allow ingress to MCP server (admin + streamableHttp)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: od-mcp-policy
+  namespace: open-design
+spec:
+  podSelector:
+    matchLabels:
+      app: od-mcp
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - port: 8080
+        - port: 8000
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8080
+        - port: 8000

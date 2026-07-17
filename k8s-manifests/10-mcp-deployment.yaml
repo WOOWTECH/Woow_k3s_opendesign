@@ -1,0 +1,134 @@
+# OD MCP Server — Secret for JWT auth
+apiVersion: v1
+kind: Secret
+metadata:
+  name: od-mcp-secrets
+  namespace: open-design
+  labels:
+    app: od-mcp
+    app.kubernetes.io/part-of: open-design
+type: Opaque
+stringData:
+  JWT_SECRET: "20b2769b76ad6f1217d8759ac56ae0536a2baa3f38c8751b7153746021a06a09"
+  ADMIN_PASSWORD: "admin"
+---
+# OD MCP Server — PVC for config persistence
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: od-mcp-data
+  namespace: open-design
+  labels:
+    app: od-mcp
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Mi
+---
+# OD MCP Server — Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: od-mcp
+  namespace: open-design
+  labels:
+    app: od-mcp
+    app.kubernetes.io/part-of: open-design
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: od-mcp
+  template:
+    metadata:
+      labels:
+        app: od-mcp
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: woowtechcluster1-aorus-15p-xd
+      containers:
+        - name: od-mcp
+          image: localhost/od-mcp:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+              name: admin
+            - containerPort: 8000
+              name: mcp
+          env:
+            - name: OD_API_BASE
+              value: "http://open-design-svc:7457"
+            - name: MCP_SERVER_PORT
+              value: "8000"
+            - name: ADMIN_PORT
+              value: "8080"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: od-mcp-secrets
+                  key: JWT_SECRET
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: od-mcp-secrets
+                  key: ADMIN_PASSWORD
+            - name: CONFIG_DIR
+              value: /data
+            - name: NAMESPACE
+              value: open-design
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: od-mcp-data
+---
+# OD MCP Server — Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: od-mcp-svc
+  namespace: open-design
+  labels:
+    app: od-mcp
+    app.kubernetes.io/part-of: open-design
+spec:
+  type: ClusterIP
+  selector:
+    app: od-mcp
+  ports:
+    - name: admin
+      port: 8080
+      targetPort: 8080
+    - name: mcp
+      port: 8000
+      targetPort: 8000
