@@ -21,6 +21,7 @@ metadata:
   labels:
     app: od-mcp
 spec:
+  storageClassName: local-path
   accessModes:
     - ReadWriteOnce
   resources:
@@ -84,10 +85,10 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 500m
               memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 3Gi
           startupProbe:
             httpGet:
               path: /healthz

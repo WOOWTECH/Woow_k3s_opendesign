@@ -2,11 +2,10 @@
 
 > **Self-hosted AI Design Platform on Kubernetes** — Deploy [nexu-io/open-design](https://github.com/nexu-io/open-design) on K3s with Claude Code + OpenCode agent CLIs pre-installed, web console, and Cloudflare Tunnel exposure.
 
-![Open Design](https://img.shields.io/badge/Open_Design-v0.12.1-orange)
+![Open Design](https://img.shields.io/badge/Open_Design-v0.15.1-orange)
 ![K3s](https://img.shields.io/badge/K3s-v1.34-blue)
 ![Node.js](https://img.shields.io/badge/Node.js-24-green)
-![Claude Code](https://img.shields.io/badge/Claude_Code-v2.1.201-purple)
-![OpenCode](https://img.shields.io/badge/OpenCode-v1.17.13-teal)
+![Claude Code](https://img.shields.io/badge/Claude_Code-latest-purple)
 ![License](https://img.shields.io/badge/License-Apache_2.0-blue)
 
 ---
@@ -18,7 +17,10 @@ This package provides a production-ready Kubernetes deployment of **Open Design*
 | Challenge | Solution |
 |-----------|----------|
 | Open Design requires local Node.js + CLI setup | Fully containerized with all dependencies in a single Docker image |
-| Agent CLIs need manual installation | Claude Code + OpenCode pre-installed and auto-detected by daemon |
+| Agent CLIs need manual installation | Claude Code pre-installed and auto-detected by daemon |
+| **PDF/PPTX/Image export returns 501** | **Headless Playwright renderer replaces Electron desktop renderer** |
+| **Standalone HTML missing images** | **Response interceptor embeds images as base64 data URIs** |
+| **Image export uses File System Access API** | **Monkey-patch redirects to server-side rendering** |
 | No remote terminal access to the design pod | Web-based ttyd terminal console with Flask dashboard |
 | Exposing to the internet safely | Cloudflare Tunnel integration with HTTPS and edge security |
 | CLI auth state lost on pod restart | Persistent `/home` volume (PVC) preserves login sessions |
@@ -59,8 +61,9 @@ graph TB
         subgraph ns[Namespace: open-design]
             subgraph daemon[Open Design Pod]
                 OD[Node.js Daemon<br/>Port 7457]
-                CC[Claude Code CLI<br/>v2.1.201]
-                OC[OpenCode CLI<br/>v1.17.13]
+                HE[headless-entry.mjs<br/>Response Interceptors]
+                HR[headless-renderer.py<br/>Playwright Chromium]
+                CC[Claude Code CLI]
                 WEB[Next.js Static UI]
             end
             subgraph console[Console Pod]
@@ -80,13 +83,15 @@ graph TB
     CF -->|open-design.your-domain.io| SVC1
     CF -->|open-design-tui.your-domain.io| SVC2
     CF -->|open-design-term.your-domain.io| SVC2
-    SVC1 --> OD
+    SVC1 --> HE
+    HE --> OD
+    HE --> HR
     SVC2 --> FLASK
     SVC2 --> TTYD
     OD --> CC
-    OD --> OC
     OD --> PVC1
     OD --> PVC2
+    HR -.->|renders slides| OD
     TTYD -.->|kubectl exec| OD
 
     style ns fill:#f9f4ee,stroke:#c96442
@@ -134,7 +139,9 @@ graph LR
 
 ```
 .
-├── Dockerfile.open-design          # Multi-stage build: Node 24 + agent CLIs
+├── Dockerfile.open-design          # Multi-stage build: Node 24 + Playwright Chromium
+├── headless-entry.mjs              # Node.js entry point with export interceptors
+├── headless-renderer.py            # Python Playwright slide renderer
 ├── deploy.sh                       # One-click build → import → apply script
 ├── k8s-manifests/
 │   ├── 00-namespace.yaml           # Namespace: open-design
@@ -252,19 +259,49 @@ The login state persists across pod restarts thanks to the `open-design-home-pvc
 | Component | CPU Request | CPU Limit | Memory Request | Memory Limit |
 |-----------|-------------|-----------|----------------|--------------|
 | Daemon | 1000m | 4000m | 2Gi | 8Gi |
+| MCP Server | 100m | 1000m | 512Mi | 3Gi |
 | Console | 100m | 500m | 128Mi | 512Mi |
+
+> **Note**: MCP Server memory increased from 512Mi to 3Gi. Supergateway + Uvicorn + Python SSE peaks at ~1.5Gi for large prompts. OOMKilled at lower limits.
 
 ## Export Formats
 
-All export formats tested and verified:
+All export formats tested and verified on both deck (slides) and landing page projects:
 
-| Format | Status | Notes |
-|--------|--------|-------|
-| Export as PDF | Working | Opens in new tab (requires popup permission) |
-| Export as PPTX | Working | Editable or screenshot mode |
-| Export as Image | Working | PNG, JPEG, WebP formats |
-| Download as .zip | Working | Instant download |
-| Export as standalone HTML | Working | Single-file HTML |
+| Format | Deck Project | HTML Project | How It Works |
+|--------|-------------|-------------|--------------|
+| Export as PDF | 6.5 MB, 5 pages | 916 KB | fetch monkey-patch redirects `/export/pdf` to `/export/pdf-image` for blob download |
+| Export as PPTX (Screenshot) | 4.4 MB, 5 slides | N/A | Server-side Playwright renders each slide to PNG, assembled by pptxgenjs |
+| Export as Image (PNG) | 59 KB - 1.5 MB per slide | 1.3 MB | MutationObserver hijacks Save button, calls `/export/image` API |
+| Export as Image (JPEG) | 45 KB - 354 KB | 354 KB | Same as PNG, server returns JPEG |
+| Export as Image (WebP) | 27 KB - 239 KB | 239 KB | Server returns PNG, client re-encodes via `canvas.toBlob('image/webp')` |
+| Download as .zip | 4.2 MB | 17 KB | Native OD feature, always works |
+| Export as standalone HTML | 11 MB (images embedded) | 50 KB | Response interceptor inlines `<img src="assets/...">` as base64 |
+
+### Export Architecture
+
+The OD daemon has a **two-tier architecture** for exports:
+- **Electron desktop mode**: Uses IPC to Chromium for rendering (not available on K3s)
+- **Bare daemon mode (K3s)**: Without Electron, all rendering-dependent exports return 501
+
+**Our fix** injects a headless Playwright renderer via `headless-entry.mjs`:
+
+```
+headless-entry.mjs
+├── Creates headlessSlideRenderer(input)
+│    └── execFileAsync(python3, headless-renderer.py, input)
+│         └── Playwright Chromium renders slides to PNG/JPEG
+│              └── Loads assets from http://localhost:7457/ (async, non-blocking)
+├── Creates headlessPdfExporter(input)
+│    └── execFileAsync(python3, pdf-script, input)
+│         └── Playwright page.pdf() for vector PDF
+├── Response Interceptors:
+│    ├── PDF: fetch monkey-patch redirects /export/pdf → /export/pdf-image
+│    ├── HTML: inlines <img src="assets/..."> as base64 data URIs
+│    └── Image: MutationObserver hijacks Save dialog → /export/image API
+└── startServer({ desktopSlideRenderer, desktopPdfExporter })
+     └── OD daemon with export routes ENABLED
+```
 
 ## Docker Image Details
 
@@ -272,17 +309,18 @@ The multi-stage Dockerfile (`Dockerfile.open-design`) builds:
 
 **Stage 1 (builder):**
 - Base: `node:24-slim`
-- Clones [nexu-io/open-design](https://github.com/nexu-io/open-design) from source
+- Clones [nexu-io/open-design](https://github.com/nexu-io/open-design) v0.15.1 from source
 - Installs dependencies with `corepack pnpm`
 - Builds web UI (static export) and daemon
 
 **Stage 2 (runtime):**
 - Base: `node:24-slim` (Debian for glibc compatibility)
 - Installs `tini` as PID 1 for proper child process management
+- Installs **Playwright Chromium** + Python venv for headless rendering
 - Installs **Claude Code** via `npm install -g @anthropic-ai/claude-code`
-- Installs **OpenCode** via official installer (`opencode.ai/install`)
-- Copies built application from Stage 1
-- Final image size: ~3.5 GB
+- Copies `headless-entry.mjs` and `headless-renderer.py` for export support
+- CMD: `node headless-entry.mjs` (wraps daemon with renderer injection)
+- Final image size: ~6.9 GB (includes Chromium browser)
 
 ## Security
 
@@ -301,7 +339,12 @@ The multi-stage Dockerfile (`Dockerfile.open-design`) builds:
 | Claude auth fails: "Invalid API key" | `ANTHROPIC_API_KEY` placeholder overrides login | Remove `ANTHROPIC_API_KEY` from deployment env |
 | ttyd returns 502 | NetworkPolicy blocks console ports | Add `od-console-policy` with ports 18790 + 7681 |
 | Claude login lost after restart | `/home/opendesign` not persistent | Mount `open-design-home-pvc` at `/home/opendesign` |
-| PDF export popup blocked | Browser blocks `window.open()` | Allow popups for the domain in browser settings |
+| Export returns 501 | No headless renderer (using old od.mjs entry point) | Use `headless-entry.mjs` as CMD in Dockerfile |
+| Export returns 502 (renderer crash) | `execFileSync` deadlock or paginate clip bug | Ensure using latest `headless-entry.mjs` with async execFile |
+| MCP pod OOMKilled | Memory limit too low for large prompts | Increase MCP memory limit to 3Gi |
+| Image export only exports slide 1 | Missing `deck:true` in request body | Ensure latest `headless-entry.mjs` with deck detection |
+| Standalone HTML images broken | `inlineRelativeAssets()` doesn't handle `<img>` | Response interceptor handles this automatically |
+| Image export fails on mobile | File System Access API not available | Monkey-patch redirects to server-side `/export/image` API |
 
 ## URLs
 
@@ -312,6 +355,62 @@ The multi-stage Dockerfile (`Dockerfile.open-design`) builds:
 | Web Terminal | `https://open-design-term.your-domain.io` | ttyd browser terminal |
 | Health Check | `https://open-design.your-domain.io/api/health` | `{"ok":true,"version":"0.12.1"}` |
 | Agents API | `https://open-design.your-domain.io/api/agents` | List detected agent CLIs |
+
+## Changelog
+
+### v2.0.0 — Headless Export Engine (2026-07-22)
+
+**Problem**: On self-hosted K3s (without Electron), the OD daemon returned HTTP 501 for all rendering-dependent exports (PDF, PPTX, Image). Standalone HTML exported with broken images. The frontend's image export used the File System Access API which doesn't work on mobile or headless browsers.
+
+**Root Cause**: OD daemon has a two-tier architecture:
+- **Electron desktop**: Provides `desktopSlideRenderer` and `desktopPdfExporter` callbacks via IPC
+- **Bare daemon (K3s)**: These callbacks are `null`, causing all export routes to return 501
+
+**Solution**: Created a headless Playwright-based renderer that injects into `startServer()`:
+
+#### New Files
+
+| File | Purpose |
+|------|---------|
+| `headless-renderer.py` | Python Playwright script. Renders OD slides to PNG/JPEG screenshots. Supports deck mode (slide-by-slide via `<deck-stage>`), page mode (full-page), paginate mode (scroll-based chunking), and stitch mode (all slides as one tall image). |
+| `headless-entry.mjs` | Node.js entry point. Wraps `startServer()` with headless renderer injection. Adds response interceptors for PDF binary download, HTML image inlining, and image export monkey-patch. Uses **async** `execFile` (critical: sync would deadlock since renderer loads assets from the daemon itself). |
+
+#### Response Interceptors (injected via `<script data-od-headless-patch>`)
+
+| Interceptor | What it does | Why it's needed |
+|-------------|-------------|----------------|
+| **PDF fetch monkey-patch** | Overrides `window.fetch()` to redirect `POST /export/pdf` to `/export/pdf-image`. Triggers blob download, returns `{ok:true}` to satisfy frontend's `dc()` function. | Frontend's PDF export expects Electron IPC (`t.json().catch(()=>({}))`), has no code path to trigger a file download from HTTP response. |
+| **HTML image inliner** | Intercepts `GET /export/...?inline=1` responses. Post-processes HTML to replace `<img src="assets/...">` with `data:image/...;base64,...` data URIs. | OD's `inlineRelativeAssets()` only handles `<link>` and `<script>` tags. Images are a known gap (nexu-io/open-design#368). |
+| **Image export hijacker** | MutationObserver detects "Export as image" dialog. Hijacks Save button to call `/export/image` API with correct slide index and `deck:true`. WebP: requests PNG from server, re-encodes via `canvas.toBlob('image/webp')`. | Frontend captures canvas snapshots from iframes which fails on mobile/headless. Server-side rendering is more reliable. |
+
+#### Bug Fixes
+
+| Bug | Root Cause | Fix |
+|-----|-----------|-----|
+| `execFileSync` deadlock | Synchronous child process blocked event loop. Renderer loaded assets from `localhost:7457` (the daemon), which was blocked. | Changed to `execFileAsync = promisify(execFile)` |
+| Paginate mode crash (`Clipped area outside image`) | `page.screenshot(clip={y: offset})` fails when offset > viewport height | Scroll to position first, then clip from viewport origin |
+| Image export always renders slide 1 | Missing `deck:true` in API request body | Detect deck from `.speaker-notes-panel-meta` + `.deck-thumbnail-rail` |
+| Slide index detection picks wrong element | `"6/6 checks passed"` matched the `N/M` regex | Only search deck-specific DOM elements |
+| fileName detection fails for `"slides.html Close tab"` | Tab text included " Close tab" suffix | Clean text before matching `.html$` |
+| PDF download shows blank pages | Browser print-to-PDF only captures viewport | Switched from 501 fallback to fetch monkey-patch with blob download |
+
+#### Metrics
+
+| Metric | Before | After |
+|--------|--------|-------|
+| API exports working | 2/7 (29%) | 7/7 (100%) |
+| UI exports working (deck) | 2/8 (25%) | 8/8 (100%) |
+| UI exports working (HTML) | 2/6 (33%) | 6/6 (100%) |
+| OD version | v0.14.2 | v0.15.1 |
+| MCP memory limit | 512Mi | 3Gi |
+
+### v1.0.0 — Initial K3s Deployment Package
+
+- Multi-stage Docker image with Node.js 24 + agent CLIs
+- K8s manifests for namespace, secrets, config, PVC, deployment, service, network policy
+- Web console with Flask dashboard + ttyd terminal
+- Cloudflare Tunnel integration
+- deploy.sh one-click deployment script
 
 ## Support
 

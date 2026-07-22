@@ -1,9 +1,12 @@
 # =============================================================
-# Open Design — Custom Image with Agent CLIs
+# Open Design — Custom Image with Headless Export Support
 #
 # Multi-stage build:
 #   Stage 1: Clone & build open-design from source
-#   Stage 2: Runtime with opencode + Claude Code pre-installed
+#   Stage 2: Runtime with Playwright Chromium for headless export
+#
+# Headless renderer injects desktopSlideRenderer into startServer(),
+# enabling PDF/PPTX/Image export on self-hosted (non-Electron) K3s.
 #
 # Build: docker build -t open-design:latest -f Dockerfile.open-design .
 # =============================================================
@@ -97,6 +100,13 @@ RUN mkdir -p /home/opendesign/.opencode/bin \
 WORKDIR /app
 COPY --from=builder --chown=opendesign:opendesign /app /app
 
+# ── Headless export renderer ────────────────────────────────────
+# These scripts inject a Playwright-based slide renderer into the
+# OD daemon, replacing the Electron desktop renderer for self-hosted
+# deployments. This enables native PDF/PPTX/Image export.
+COPY --chown=opendesign:opendesign headless-renderer.py /app/headless-renderer.py
+COPY --chown=opendesign:opendesign headless-entry.mjs /app/headless-entry.mjs
+
 # Create data directory
 RUN mkdir -p /app/.od && chown -R opendesign:opendesign /app/.od
 
@@ -108,10 +118,13 @@ ENV OD_PORT=7457
 ENV HOME=/home/opendesign
 ENV PATH="/opt/venv/bin:/home/opendesign/.opencode/bin:/usr/local/bin:$PATH"
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
+ENV PYTHON_PATH=/opt/venv/bin/python3
 
 EXPOSE 7457
 
 USER opendesign
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["node", "apps/daemon/bin/od.mjs", "--host", "0.0.0.0", "--port", "7457", "--no-open"]
+# Use headless-entry.mjs instead of od.mjs to inject Playwright renderer
+CMD ["node", "headless-entry.mjs", "--host", "0.0.0.0", "--port", "7457"]
