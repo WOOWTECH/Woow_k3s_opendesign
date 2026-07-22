@@ -244,6 +244,7 @@ The login state persists across pod restarts thanks to the `open-design-home-pvc
 | `OD_PORT` | `7457` | Daemon listen port |
 | `OD_BIND_HOST` | `0.0.0.0` | Bind address |
 | `OD_ALLOWED_ORIGINS` | `https://open-design.your-domain.io` | CORS allowed origins |
+| `OD_PUBLIC_BASE_URL` | `https://open-design.your-domain.io` | **Required for MCP OAuth.** Public HTTPS URL for OAuth callback registration. Without this, the daemon derives the URL from internal request headers (http:// behind proxy), causing `invalid_request` errors from OAuth providers. |
 | `OD_DISABLE_API_AUTH` | `1` | Disable token auth (Cloudflare handles security) |
 
 ### Secrets
@@ -303,6 +304,69 @@ headless-entry.mjs
      └── OD daemon with export routes ENABLED
 ```
 
+## MCP Server Integration
+
+Open Design supports connecting to external MCP (Model Context Protocol) servers for extending agent capabilities. The Integrations page (`/integrations`) allows adding MCP servers with two authentication modes:
+
+### OAuth MCP Servers (e.g. Higgsfield)
+
+For MCP servers that require OAuth authorization (like [Higgsfield/OpenClaw](https://higgsfield.ai/mcp)):
+
+1. Go to **Integrations → External MCP Servers → Add Server**
+2. Select a template (e.g. "Higgsfield (OpenClaw)") or enter a custom URL
+3. Click **Connect** — OD opens the OAuth authorization page
+4. After approval, the token is stored server-side and persists across sessions
+
+**Critical**: `OD_PUBLIC_BASE_URL` must be set to your public HTTPS domain. Without it, the OAuth callback URL is registered as `http://` (from internal proxy headers) but the browser redirects via `https://`, causing `invalid_request` errors.
+
+```
+# OAuth flow:
+Browser → OD daemon (POST /api/mcp/oauth/start)
+  → Dynamic Client Registration (RFC 7591) with callback URL from OD_PUBLIC_BASE_URL
+  → Authorization URL opened in browser
+  → User approves
+  → OAuth provider redirects to https://<domain>/api/mcp/oauth/callback
+  → OD exchanges code for token (PKCE + state validation)
+  → Token persisted in mcp-tokens.json
+```
+
+### Token-in-URL MCP Servers (e.g. Custom Odoo MCP)
+
+For MCP servers that use a private token embedded in the URL:
+
+```
+https://your-mcp-server.example.com/private_<token>/mcp
+```
+
+Configure with:
+- **Transport**: `http` (StreamableHTTP, not SSE)
+- **Auth Mode**: `none` (token is in the URL itself)
+
+Via API:
+```bash
+curl -X PUT http://localhost:7457/api/mcp/servers \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "servers": [{
+      "id": "custom",
+      "transport": "http",
+      "enabled": true,
+      "label": "My MCP Server",
+      "url": "https://your-server.example.com/private_xxx/mcp",
+      "authMode": "none"
+    }]
+  }'
+```
+
+### Troubleshooting MCP Connections
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `Auth provider returned error: invalid_request` | OAuth callback URL uses `http://` instead of `https://` | Set `OD_PUBLIC_BASE_URL=https://your-domain` in ConfigMap |
+| `could not discover OAuth metadata` | Server doesn't support OAuth (uses token-in-URL) | Change `authMode` to `none` and `transport` to `http` |
+| MCP server shows as connected but tools don't work | Wrong transport type (SSE vs StreamableHTTP) | Change `transport` from `sse` to `http` for StreamableHTTP servers |
+| OAuth cached with wrong redirect URI | Stale DCR client registration | Delete `mcp-oauth-clients.json` and restart pod |
+
 ## Docker Image Details
 
 The multi-stage Dockerfile (`Dockerfile.open-design`) builds:
@@ -357,6 +421,26 @@ The multi-stage Dockerfile (`Dockerfile.open-design`) builds:
 | Agents API | `https://open-design.your-domain.io/api/agents` | List detected agent CLIs |
 
 ## Changelog
+
+### v2.1.0 — MCP OAuth & Integration Fix (2026-07-22)
+
+**Problem**: External MCP servers (Higgsfield, custom Odoo MCP) failed to connect through Open Design's Integrations page.
+
+**Root Causes**:
+1. **OAuth `invalid_request`**: The daemon derived its callback URL from internal request headers (`http://` behind Cloudflare tunnel), but the browser redirects via `https://`. The OAuth provider's redirect_uri validation failed on scheme mismatch.
+2. **Custom MCP misconfigured**: When adding a token-in-URL MCP server via the UI, OD defaults to `authMode: "oauth"` and `transport: "sse"`, but these servers need `authMode: "none"` and `transport: "http"` (StreamableHTTP).
+
+**Fixes**:
+- Added `OD_PUBLIC_BASE_URL` to ConfigMap — forces the daemon's `getPublicBaseUrl()` to return the correct HTTPS URL for OAuth Dynamic Client Registration (DCR)
+- Documented how to configure both OAuth and token-in-URL MCP servers
+- Added MCP troubleshooting table
+
+**Configuration**:
+```yaml
+# k8s-manifests/02-config.yaml
+data:
+  OD_PUBLIC_BASE_URL: "https://open-design.your-domain.io"  # Required for MCP OAuth
+```
 
 ### v2.0.0 — Headless Export Engine (2026-07-22)
 

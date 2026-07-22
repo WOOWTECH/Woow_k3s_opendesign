@@ -8,6 +8,10 @@ metadata:
     app.kubernetes.io/part-of: open-design
 data:
   OD_ALLOWED_ORIGINS: "https://__DOMAIN__"
+  # Public-facing URL for MCP OAuth callback — must use HTTPS to match Cloudflare tunnel.
+  # Without this, OAuth redirect_uri is registered as http:// (from internal request headers)
+  # but the browser redirects via https://, causing "invalid_request" from auth providers.
+  OD_PUBLIC_BASE_URL: "https://__DOMAIN__"
   OD_PORT: "7457"
   OD_BIND_HOST: "0.0.0.0"
   # Auth handled by Cloudflare Tunnel — disable daemon-level API auth

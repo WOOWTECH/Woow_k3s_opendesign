@@ -21,9 +21,9 @@ metadata:
   labels:
     app: od-mcp
 spec:
-  storageClassName: local-path
   accessModes:
     - ReadWriteOnce
+  storageClassName: local-path
   resources:
     requests:
       storage: 100Mi
