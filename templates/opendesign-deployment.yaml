@@ -1,8 +1,9 @@
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: open-design
-  namespace: open-design
+  namespace: {{ .Values.namespace.name }}
   labels:
     app: open-design
     app.kubernetes.io/component: daemon
@@ -20,14 +21,14 @@ spec:
         app: open-design
     spec:
       nodeSelector:
-        kubernetes.io/hostname: "__K3S_NODE_HOSTNAME__"
+        kubernetes.io/hostname: {{ .Values.opendesign.nodeHostname | quote }}
       securityContext:
         fsGroup: 1001
       terminationGracePeriodSeconds: 30
       containers:
         - name: open-design
-          image: localhost/open-design:latest
-          imagePullPolicy: Never
+          image: "{{ .Values.opendesign.image.repository }}:{{ .Values.opendesign.image.tag }}"
+          imagePullPolicy: {{ .Values.opendesign.image.pullPolicy }}
           ports:
             - containerPort: 7457
               name: http
@@ -40,12 +41,7 @@ spec:
             - name: od-home
               mountPath: /home/opendesign
           resources:
-            requests:
-              cpu: 1000m
-              memory: 2Gi
-            limits:
-              cpu: 4000m
-              memory: 8Gi
+            {{- toYaml .Values.opendesign.resources | nindent 12 }}
           readinessProbe:
             httpGet:
               path: /api/health

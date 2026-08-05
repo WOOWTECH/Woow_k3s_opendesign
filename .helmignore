@@ -1,0 +1,17 @@
+# Patterns to ignore when building packages.
+.DS_Store
+.git/
+.gitignore
+.bak
+.tmproj
+.project
+.idea/
+*.tmproj
+.vscode/
+
+# OWNERS file for the maintainers of this chart
+OWNERS
+
+# Original Kustomize manifests kept in git history / other branches;
+# this chart is the authoritative deployment surface.
+k8s-manifests/

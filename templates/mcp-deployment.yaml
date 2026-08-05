@@ -1,39 +1,11 @@
-# OD MCP Server — Secret for JWT auth
-apiVersion: v1
-kind: Secret
-metadata:
-  name: od-mcp-secrets
-  namespace: open-design
-  labels:
-    app: od-mcp
-    app.kubernetes.io/part-of: open-design
-type: Opaque
-stringData:
-  JWT_SECRET: "20b2769b76ad6f1217d8759ac56ae0536a2baa3f38c8751b7153746021a06a09"
-  ADMIN_PASSWORD: "admin"
----
-# OD MCP Server — PVC for config persistence
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: od-mcp-data
-  namespace: open-design
-  labels:
-    app: od-mcp
-spec:
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: local-path
-  resources:
-    requests:
-      storage: 100Mi
+{{- if .Values.mcp.enabled }}
 ---
 # OD MCP Server — Deployment
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: od-mcp
-  namespace: open-design
+  namespace: {{ .Values.namespace.name }}
   labels:
     app: od-mcp
     app.kubernetes.io/part-of: open-design
@@ -48,11 +20,11 @@ spec:
         app: od-mcp
     spec:
       nodeSelector:
-        kubernetes.io/hostname: woowtechcluster1-aorus-15p-xd
+        kubernetes.io/hostname: {{ .Values.mcp.nodeHostname }}
       containers:
         - name: od-mcp
-          image: localhost/od-mcp:latest
-          imagePullPolicy: Never
+          image: "{{ .Values.mcp.image.repository }}:{{ .Values.mcp.image.tag }}"
+          imagePullPolicy: {{ .Values.mcp.image.pullPolicy }}
           ports:
             - containerPort: 8080
               name: admin
@@ -60,11 +32,11 @@ spec:
               name: mcp
           env:
             - name: OD_API_BASE
-              value: "http://open-design-svc:7457"
+              value: {{ .Values.mcp.env.OD_API_BASE | quote }}
             - name: MCP_SERVER_PORT
-              value: "8000"
+              value: {{ .Values.mcp.env.MCP_SERVER_PORT | quote }}
             - name: ADMIN_PORT
-              value: "8080"
+              value: {{ .Values.mcp.env.ADMIN_PORT | quote }}
             - name: JWT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -76,19 +48,14 @@ spec:
                   name: od-mcp-secrets
                   key: ADMIN_PASSWORD
             - name: CONFIG_DIR
-              value: /data
+              value: {{ .Values.mcp.env.CONFIG_DIR | quote }}
             - name: NAMESPACE
-              value: open-design
+              value: {{ .Values.namespace.name | quote }}
           volumeMounts:
             - name: data
               mountPath: /data
           resources:
-            requests:
-              cpu: 100m
-              memory: 512Mi
-            limits:
-              cpu: "1"
-              memory: 3Gi
+            {{- toYaml .Values.mcp.resources | nindent 12 }}
           startupProbe:
             httpGet:
               path: /healthz
@@ -112,24 +79,4 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: od-mcp-data
----
-# OD MCP Server — Service
-apiVersion: v1
-kind: Service
-metadata:
-  name: od-mcp-svc
-  namespace: open-design
-  labels:
-    app: od-mcp
-    app.kubernetes.io/part-of: open-design
-spec:
-  type: ClusterIP
-  selector:
-    app: od-mcp
-  ports:
-    - name: admin
-      port: 8080
-      targetPort: 8080
-    - name: mcp
-      port: 8000
-      targetPort: 8000
+{{- end }}

@@ -1,10 +1,12 @@
+{{- if .Values.console.enabled }}
+---
 # Open Design Console — web dashboard + ttyd terminal
 # Pattern: python:3.9-slim base + runtime tool install + ConfigMap app injection
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: od-console
-  namespace: open-design
+  namespace: {{ .Values.namespace.name }}
   labels:
     app: od-console
     app.kubernetes.io/component: console
@@ -25,7 +27,12 @@ spec:
       terminationGracePeriodSeconds: 15
       containers:
         - name: console
-          image: python:3.9-slim
+          image: {{ if .Values.console.image.tag -}}
+                 "{{ .Values.console.image.repository }}:{{ .Values.console.image.tag }}"
+                 {{- else -}}
+                 {{ .Values.console.image.repository }}
+                 {{- end }}
+          imagePullPolicy: {{ .Values.console.image.pullPolicy }}
           command:
             - sh
             - -c
@@ -65,7 +72,7 @@ spec:
               name: ttyd
           env:
             - name: NAMESPACE
-              value: "open-design"
+              value: {{ .Values.namespace.name | quote }}
             - name: TUI_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -77,12 +84,7 @@ spec:
             - name: html
               mountPath: /mnt/html
           resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 500m
-              memory: 512Mi
+            {{- toYaml .Values.console.resources | nindent 12 }}
           readinessProbe:
             tcpSocket:
               port: 18790
@@ -104,25 +106,4 @@ spec:
           configMap:
             name: od-console-html
             defaultMode: 0644
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: od-console-svc
-  namespace: open-design
-  labels:
-    app: od-console
-    app.kubernetes.io/part-of: open-design
-spec:
-  selector:
-    app: od-console
-  ports:
-    - name: http
-      protocol: TCP
-      port: 18790
-      targetPort: 18790
-    - name: ttyd
-      protocol: TCP
-      port: 7681
-      targetPort: 7681
-  type: ClusterIP
+{{- end }}

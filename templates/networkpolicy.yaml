@@ -1,9 +1,11 @@
+{{- if .Values.networkPolicy.enabled }}
+---
 # NetworkPolicy: Allow ingress from cloudflare tunnel and internal traffic
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: open-design-policy
-  namespace: open-design
+  namespace: {{ .Values.namespace.name }}
 spec:
   podSelector:
     matchLabels:
@@ -19,13 +21,14 @@ spec:
         - podSelector: {}
       ports:
         - port: 7457
+{{- if .Values.console.enabled }}
 ---
 # NetworkPolicy: Allow ingress to console (dashboard + ttyd)
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: od-console-policy
-  namespace: open-design
+  namespace: {{ .Values.namespace.name }}
 spec:
   podSelector:
     matchLabels:
@@ -43,13 +46,15 @@ spec:
       ports:
         - port: 18790
         - port: 7681
+{{- end }}
+{{- if .Values.mcp.enabled }}
 ---
 # NetworkPolicy: Allow ingress to MCP server (admin + streamableHttp)
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: od-mcp-policy
-  namespace: open-design
+  namespace: {{ .Values.namespace.name }}
 spec:
   podSelector:
     matchLabels:
@@ -67,3 +72,5 @@ spec:
       ports:
         - port: 8080
         - port: 8000
+{{- end }}
+{{- end }}

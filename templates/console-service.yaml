@@ -1,0 +1,30 @@
+{{- if .Values.console.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: od-console-svc
+  namespace: {{ .Values.namespace.name }}
+  labels:
+    app: od-console
+    app.kubernetes.io/part-of: open-design
+spec:
+  selector:
+    app: od-console
+  ports:
+    - name: http
+      protocol: TCP
+      port: {{ .Values.console.service.httpPort }}
+      targetPort: 18790
+      {{- if and (eq .Values.console.service.type "NodePort") .Values.console.service.httpNodePort }}
+      nodePort: {{ .Values.console.service.httpNodePort }}
+      {{- end }}
+    - name: ttyd
+      protocol: TCP
+      port: {{ .Values.console.service.ttydPort }}
+      targetPort: 7681
+      {{- if and (eq .Values.console.service.type "NodePort") .Values.console.service.ttydNodePort }}
+      nodePort: {{ .Values.console.service.ttydNodePort }}
+      {{- end }}
+  type: {{ .Values.console.service.type }}
+{{- end }}
