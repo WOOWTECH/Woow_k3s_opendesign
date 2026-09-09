@@ -8,7 +8,7 @@ description: >-
 type: application
 
 # One number for the chart and the image tag. `image.tag` defaults to this.
-version: 2.0.0
+version: 2.0.1
 # The upstream OpenDesign version baked into the image (ghcr.io/nexu-io/od).
 appVersion: "0.21.1"
 

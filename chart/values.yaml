@@ -27,7 +27,7 @@ publicUrl: ""
 # ── OpenDesign image ───────────────────────────────────────────────────────
 image:
   repository: ghcr.io/woowtech/woow-k3s-opendesign
-  # Blank = use .Chart.Version (2.0.0). The literal "latest" is rejected.
+  # Blank = use .Chart.Version (2.0.1). The literal "latest" is rejected.
   tag: ""
   # sha256:... -- when set it WINS over tag and the image is pulled by digest.
   # The release process fills this in from the `docker buildx` output.

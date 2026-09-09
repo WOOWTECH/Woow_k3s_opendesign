@@ -21,7 +21,7 @@ CHART = layout.CHART
 OPT_DIR = layout.OPT_DIR
 
 UPSTREAM_IMAGE = "ghcr.io/nexu-io/od:0.21.1@sha256:441daca881e699657bacf28e0c27b16cd6be551dfff4bd63368dd74bec581f39"
-CHART_VERSION = "2.0.0"
+CHART_VERSION = "2.0.1"
 APP_VERSION = "0.21.1"
 GHCR_IMAGE = "ghcr.io/woowtech/woow-k3s-opendesign"
 

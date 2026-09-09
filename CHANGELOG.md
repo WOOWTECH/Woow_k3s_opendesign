@@ -3,6 +3,28 @@
 Versions here are chart versions. The chart version and the published image tag
 are the same number; `appVersion` is the OpenDesign version.
 
+## 2.0.1
+
+Patch release. Chart and image contents are otherwise identical to 2.0.0.
+
+- **Pages taller than the capture viewport can be exported to PDF again.** They
+  could not be, at all: `capturePage` passed Playwright a `clip` without
+  `fullPage`, so `clip` was measured against the viewport and every segment
+  past the first (y >= 1000) fell outside the captured area. The export died
+  with `Clipped area is either empty or outside the resulting image`.
+  A short page plans one segment and worked; anything article- or
+  report-shaped plans two or more and always failed. Bisected on the live
+  deployments: 1000 px exported, 1010 px did not. Verified after the fix at
+  1010 / 1200 / 1500 / 2000 / 3000 / 6000 px, each producing
+  `ceil(height / 1000)` pages with per-page content confirmed distinct.
+- Screenshot options for a page segment now come from an exported
+  `planPageScreenshot()` so the contract has a unit test instead of living in
+  an `if/else` inside an async capture loop.
+- CI: the container smoke lane had never actually executed. It needed
+  `tests/.artifacts/*`, which only `tests/run.sh` produces and which runs in a
+  different job, and the image it looked for was in docker's store while the
+  smoke script requires podman. Both are fixed, so the lane now runs for real.
+
 ## 2.0.0
 
 Complete rewrite. The 1.0.0 chart described a hand-run topology that was never
