@@ -137,6 +137,18 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Extract chart assets
         run: python3 tests/lib/extract-chart-assets.py
+      # buildx `load: true` puts the image in DOCKER's store. The smoke script
+      # requires podman (it builds a pod — two containers sharing one netns,
+      # which docker has no equivalent of, so CONTAINER_ENGINE=docker is
+      # rejected outright) and podman keeps a separate store, so it saw no
+      # image at all. Hand the built image across rather than rebuilding it
+      # under podman, which would throw away the buildx cache.
+      - name: Hand the built image to podman
+        shell: bash
+        run: |
+          set -Eeuo pipefail -o pipefail
+          docker save woow-k3s-opendesign:smoke | podman load
+          podman image exists woow-k3s-opendesign:smoke
       - name: Two-container pod smoke (daemon plus nginx sidecar)
         # Reproduces the k8s topology: OD on loopback 7456, nginx sidecar on 7457.
         run: ./tests/container-smoke.sh woow-k3s-opendesign:smoke
