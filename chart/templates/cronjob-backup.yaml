@@ -31,6 +31,17 @@ spec:
         spec:
           restartPolicy: OnFailure
           automountServiceAccountToken: false
+          # The container runs as 1001 with every capability dropped, so unlike
+          # the main pod (root + CHOWN) it cannot fix volume ownership itself.
+          # A freshly provisioned Longhorn PVC is root:root, so without fsGroup
+          # the very first `tar czf /backup/...` fails with permission denied
+          # and the CronJob has never produced a single archive.
+          # OnRootMismatch keeps this cheap: the backup volume is chowned once,
+          # and the 20Gi data volume is skipped (its root already matches, and
+          # it is mounted read-only anyway) instead of being walked every night.
+          securityContext:
+            fsGroup: 1001
+            fsGroupChangePolicy: OnRootMismatch
           {{- with .Values.imagePullSecrets }}
           imagePullSecrets:
             {{- toYaml . | nindent 12 }}
@@ -63,8 +74,17 @@ spec:
                   # busybox tar exits 1 for delayed/soft errors such as a file
                   # changing while it is read, which is expected against a live
                   # data dir. Anything above 1 is a real failure.
+                  #
+                  # lost+found is the ext4 artefact at the root of the Longhorn
+                  # volume: root:root 0700, unreadable to uid 1001. Left in, it
+                  # made EVERY run exit 1, permanently burning the one signal
+                  # that is supposed to mean "a file moved under us". Excluding
+                  # it costs nothing (it is always empty) and gives rc=1 its
+                  # meaning back.
                   rc=0
-                  tar czf "${archive}" -C /data opendesign || rc=$?
+                  tar czf "${archive}" \
+                    --exclude='opendesign/lost+found' \
+                    -C /data opendesign || rc=$?
                   if [ "${rc}" -gt 1 ]; then
                     echo "[backup] tar failed with rc=${rc}" >&2
                     rm -f -- "${archive}"
