@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Container entrypoint for the OpenDesign pod on k3s.
+#
+# One container, one process. Signal handling and child supervision are
+# Kubernetes' job, not this script's: tini is PID 1, this script `exec`s into
+# su-exec which `exec`s into node, so the kubelet's SIGTERM reaches the Node
+# process directly and headless-entry.mjs performs the graceful shutdown.
+# The upstream add-on's two-process watchdog (a signal trap plus a shell-level
+# job wait, with its own TERM-to-KILL grace timer) is deliberately absent: the
+# reverse proxy is a separate sidecar container here, so there is no peer
+# process for this script to start, watch or tear down.
+readonly DATA_DIR=/data/opendesign
+
+# The data directory is fixed. It is baked into the image (ENV OD_DATA_DIR),
+# rendered into the chart ConfigMap, and used as the PVC mountPath. Refusing a
+# mismatch keeps a values.yaml typo from silently splitting state across two
+# paths, and keeps this root-privileged chown/chmod section from ever being
+# pointed at an attacker-chosen path by an injected environment variable.
+if [[ -n "${OD_DATA_DIR:-}" && "${OD_DATA_DIR}" != "$DATA_DIR" ]]; then
+  echo "[woow-opendesign] OD_DATA_DIR=${OD_DATA_DIR} does not match the image/PVC path ${DATA_DIR}" >&2
+  exit 78
+fi
+
+prepare_owned_dir() {
+  local dir=$1
+  if [[ -L "$dir" ]]; then
+    echo "[woow-opendesign] refusing symbolic-link runtime directory: $dir" >&2
+    exit 78
+  fi
+  if [[ -e "$dir" ]]; then
+    if [[ ! -d "$dir" ]]; then
+      echo "[woow-opendesign] runtime path is not a directory: $dir" >&2
+      exit 78
+    fi
+  else
+    # Parents are prepared first, so plain mkdir never traverses a child path
+    # that has not already passed the no-symlink check.
+    mkdir -- "$dir"
+  fi
+  if [[ -L "$dir" || ! -d "$dir" ]]; then
+    echo "[woow-opendesign] runtime directory changed during validation: $dir" >&2
+    exit 78
+  fi
+  # -h/--no-dereference prevents a late symlink swap from changing its target.
+  chown -h open-design:open-design "$dir"
+}
+
+remove_obsolete_credentials() {
+  local legacy_dir="$DATA_DIR/credentials"
+  if [[ ! -e "$legacy_dir" && ! -L "$legacy_dir" ]]; then
+    return
+  fi
+
+  # rm removes a symlink itself rather than following it. Check explicitly so a
+  # legacy symlink is never treated as a directory, and never remove DATA_DIR.
+  if [[ -L "$legacy_dir" ]]; then
+    rm -f -- "$legacy_dir"
+  else
+    rm -rf -- "$legacy_dir"
+  fi
+}
+
+# A freshly provisioned Longhorn RWO ext4 volume is mounted root:root, so PID 1
+# has to start as root to hand it to UID/GID 1001. The chart pins this with
+# securityContext.runAsUser: 0 plus capabilities CHOWN, DAC_OVERRIDE, FOWNER,
+# SETUID and SETGID; everything else is dropped and privilege escalation is
+# off. If the chart is ever changed to runAsUser: 1001 + fsGroup: 1001 this
+# check must be revisited together with the su-exec drop below.
+if [[ $(id -u) -ne 0 ]]; then
+  echo "[woow-opendesign] launcher must start as root to prepare the ${DATA_DIR} PVC mount" >&2
+  echo "[woow-opendesign] set securityContext.runAsUser: 0 on the opendesign container" >&2
+  exit 78
+fi
+
+owned_dirs=(
+  "$DATA_DIR"
+  "$DATA_DIR/home"
+  "$DATA_DIR/export-render"
+  "$DATA_DIR/export-pdf"
+)
+for dir in "${owned_dirs[@]}"; do
+  prepare_owned_dir "$dir"
+done
+for dir in "$DATA_DIR" "$DATA_DIR/home" "$DATA_DIR/export-render" "$DATA_DIR/export-pdf"; do
+  [[ ! -L "$dir" && -d "$dir" ]] || {
+    echo "[woow-opendesign] refusing unsafe chmod target: $dir" >&2
+    exit 78
+  }
+  chmod 0750 "$dir"
+done
+remove_obsolete_credentials
+
+# Exported last so nothing from the ConfigMap or podSpec can widen the bind.
+# OD_BIND_HOST=127.0.0.1 is the security floor: the daemon socket is not
+# reachable over the pod network at all, the reverse-proxy sidecar is its only
+# client, and OpenDesign's own guard (OD_BIND_HOST!=loopback requires OD_API_TOKEN or
+# OD_DISABLE_API_AUTH=1) is satisfied without disabling anything.
+export OD_DATA_DIR="$DATA_DIR"
+export OD_BIND_HOST=127.0.0.1
+export OD_PORT=7456
+export HOME="$DATA_DIR/home"
+
+exec su-exec open-design:open-design /usr/local/bin/node /opt/woow-opendesign/headless-entry.mjs

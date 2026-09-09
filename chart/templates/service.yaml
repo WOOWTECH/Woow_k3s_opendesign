@@ -1,0 +1,24 @@
+{{/*
+ClusterIP only, one port: the nginx sidecar. This is what Nginx Proxy
+Manager's "Forward Hostname" resolves to. `type` is not configurable --
+NodePort or LoadBalancer would publish OpenDesign past the auth boundary.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "opendesign.fullname" . }}
+  labels:
+    {{- include "opendesign.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.nginx.port }}
+      protocol: TCP
+  selector:
+    {{- include "opendesign.selectorLabels" . | nindent 4 }}

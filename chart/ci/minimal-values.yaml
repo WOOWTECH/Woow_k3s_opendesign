@@ -1,0 +1,4 @@
+# Smallest install that renders: publicUrl only, backup off.
+publicUrl: https://od-woow-k3s.woowtech.io
+backup:
+  enabled: false

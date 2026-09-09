@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "opendesign.fullname" . }}-nginx
+  labels:
+    {{- include "opendesign.labels" . | nindent 4 }}
+data:
+  nginx.conf: |
+{{ tpl (.Files.Get "files/nginx.conf" | required "files/nginx.conf is missing from the chart") . | indent 4 }}
+  od-export-bridge.js: |
+{{ .Files.Get "files/od-export-bridge.js" | required "files/od-export-bridge.js is missing from the chart" | indent 4 }}

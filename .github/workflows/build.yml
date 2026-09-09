@@ -1,0 +1,398 @@
+name: Validate, build, and publish
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned upstream OpenDesign 0.21.1 base, byte-identical to Dockerfile:1.
+  BUILD_FROM: ghcr.io/nexu-io/od:0.21.1@sha256:441daca881e699657bacf28e0c27b16cd6be551dfff4bd63368dd74bec581f39
+  # One release artifact family. No floating or rolling tag is ever produced.
+  IMAGE_REPOSITORY: ghcr.io/woowtech/woow-k3s-opendesign
+  CHART_OCI_REPOSITORY: oci://ghcr.io/woowtech/charts
+  # Every cluster node reports amd64; the arm64 leg and QEMU are deliberately absent.
+  BUILD_PLATFORM: linux/amd64
+  # Checksum-pinned validation tooling (verified: see docs/CI.md).
+  HELM_VERSION: 3.19.5
+  HELM_SHA256: a0a5e8c592ed3f376ac110715eff214730c7422f9a44d96cf98117d2b8b0e6c0
+  KUBECONFORM_VERSION: 0.6.7
+  KUBECONFORM_SHA256: 95f14e87aa28c09d5941f11bd024c1d02fdc0303ccaa23f61cef67bc92619d73
+  YQ_VERSION: 4.44.6
+  YQ_SHA256: 0c2b24e645b57d8e7c0566d18643a6d4f5580feeea3878127354a46f2a1e4598
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.23.0"
+          cache: npm
+          cache-dependency-path: runtime/package-lock.json
+      - name: Install validation tools
+        run: |
+          python3 -m pip install --break-system-packages PyYAML==6.0.2
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nginx shellcheck
+      - name: Install checksum-pinned helm, kubeconform, and yq
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$HOME/.local/bin" "$RUNNER_TEMP/tools"
+          cd "$RUNNER_TEMP/tools"
+
+          curl --fail --silent --show-error --location -o helm.tgz \
+            "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum --check --strict
+          tar -xzf helm.tgz linux-amd64/helm
+          mv linux-amd64/helm "$HOME/.local/bin/helm"
+
+          curl --fail --silent --show-error --location -o kubeconform.tgz \
+            "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform.tgz" | sha256sum --check --strict
+          tar -xzf kubeconform.tgz kubeconform
+          mv kubeconform "$HOME/.local/bin/kubeconform"
+
+          curl --fail --silent --show-error --location -o yq \
+            "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  yq" | sha256sum --check --strict
+          mv yq "$HOME/.local/bin/yq"
+
+          chmod +x "$HOME/.local/bin/helm" "$HOME/.local/bin/kubeconform" "$HOME/.local/bin/yq"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Show pinned tool versions
+        run: |
+          helm version --short
+          kubeconform -v
+          yq --version
+      - name: Validate
+        # tests/run.sh is the single gate: metadata/secret validators, chart
+        # lint + template + kubeconform, node unit tests, shell and nginx syntax.
+        run: ./tests/run.sh
+
+  smoke:
+    needs: validate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Build amd64 smoke image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          platforms: ${{ env.BUILD_PLATFORM }}
+          load: true
+          push: false
+          provenance: false
+          tags: woow-k3s-opendesign:smoke
+          build-args: |
+            BUILD_FROM=${{ env.BUILD_FROM }}
+            BUILD_ARCH=amd64
+            BUILD_VERSION=0.0.0-smoke
+            BUILD_DESCRIPTION=OpenDesign 0.21.1 container smoke
+            BUILD_NAME=Woow k3s OpenDesign
+            BUILD_REF=${{ github.sha }}
+            BUILD_REPOSITORY=${{ github.repository }}
+          cache-from: type=gha,scope=opendesign-amd64
+          cache-to: type=gha,scope=opendesign-amd64,mode=max
+      - name: Two-container pod smoke (daemon plus nginx sidecar)
+        # Reproduces the k8s topology: OD on loopback 7456, nginx sidecar on 7457.
+        run: ./tests/container-smoke.sh woow-k3s-opendesign:smoke
+
+  build-nonrelease:
+    if: github.ref_type != 'tag'
+    needs: [validate, smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Read chart version
+        id: metadata
+        shell: bash
+        run: echo "version=$(./.github/scripts/chart-version.sh chart/Chart.yaml)" >> "$GITHUB_OUTPUT"
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Build image without publishing
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          platforms: ${{ env.BUILD_PLATFORM }}
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ env.IMAGE_REPOSITORY }}:${{ steps.metadata.outputs.version }}
+          build-args: |
+            BUILD_FROM=${{ env.BUILD_FROM }}
+            BUILD_ARCH=amd64
+            BUILD_VERSION=${{ steps.metadata.outputs.version }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
+            BUILD_DESCRIPTION=OpenDesign 0.21.1 for woow-k3s behind Nginx Proxy Manager
+            BUILD_NAME=Woow k3s OpenDesign
+            BUILD_REF=${{ github.sha }}
+            BUILD_REPOSITORY=${{ github.repository }}
+          cache-from: type=gha,scope=opendesign-amd64
+          cache-to: type=gha,scope=opendesign-amd64,mode=max
+      - name: Verify locked OpenCode runtime as UID 1001 and the Pi/nginx fences
+        run: |
+          docker run --rm --platform ${{ env.BUILD_PLATFORM }} --user 1001:1001 \
+            --entrypoint /bin/sh \
+            ${{ env.IMAGE_REPOSITORY }}:${{ steps.metadata.outputs.version }} \
+            -ceu '
+              test "$(id -u)" = 1001
+              test "$(opencode --version)" = 1.18.29
+              test "$(command -v opencode)" = /opt/woow-opendesign/opencode/node_modules/.bin/opencode
+              ! command -v opencode-cli >/dev/null 2>&1
+              ! command -v pi >/dev/null 2>&1
+              ! command -v nginx >/dev/null 2>&1
+              test ! -e /usr/local/bin/pi
+              test ! -e /opt/woow-opendesign/pi-wrapper.mjs
+              test ! -e /opt/woow-opendesign/ha-pi-wrapper.mjs
+            '
+      - name: Package the chart without publishing
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/tools" "$HOME/.local/bin"
+          cd "$RUNNER_TEMP/tools"
+          curl --fail --silent --show-error --location -o helm.tgz \
+            "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum --check --strict
+          tar -xzf helm.tgz linux-amd64/helm
+          install -m 0755 linux-amd64/helm "$HOME/.local/bin/helm"
+          cd "$GITHUB_WORKSPACE"
+          "$HOME/.local/bin/helm" package chart/ --destination "$RUNNER_TEMP/chart"
+          ls -l "$RUNNER_TEMP/chart"
+          test -f "$RUNNER_TEMP/chart/opendesign-${{ steps.metadata.outputs.version }}.tgz"
+
+  release-preflight:
+    if: github.ref_type == 'tag'
+    needs: [validate, smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Enforce immutable release version
+        env:
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GHCR_ACTOR: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./.github/scripts/release-preflight.sh
+
+  release-architecture-gate:
+    if: github.ref_type == 'tag'
+    needs: [validate, smoke, release-preflight]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Read chart version
+        id: metadata
+        shell: bash
+        run: echo "version=$(./.github/scripts/chart-version.sh chart/Chart.yaml)" >> "$GITHUB_OUTPUT"
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Build release-gate image without publishing
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          platforms: ${{ env.BUILD_PLATFORM }}
+          load: true
+          push: false
+          provenance: false
+          tags: woow-k3s-opendesign-release-gate:${{ steps.metadata.outputs.version }}
+          build-args: |
+            BUILD_FROM=${{ env.BUILD_FROM }}
+            BUILD_ARCH=amd64
+            BUILD_VERSION=${{ steps.metadata.outputs.version }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
+            BUILD_DESCRIPTION=OpenDesign 0.21.1 for woow-k3s behind Nginx Proxy Manager
+            BUILD_NAME=Woow k3s OpenDesign
+            BUILD_REF=${{ github.sha }}
+            BUILD_REPOSITORY=${{ github.repository }}
+          cache-from: type=gha,scope=opendesign-amd64
+          cache-to: type=gha,scope=opendesign-amd64,mode=max
+      - name: Verify native OpenCode BYOK streaming and key isolation
+        env:
+          IMAGE: woow-k3s-opendesign-release-gate:${{ steps.metadata.outputs.version }}
+          PLATFORM: ${{ env.BUILD_PLATFORM }}
+          BYOK_FAKE_KEY: od-byok-test-key-not-a-secret
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          container="woow-od-release-gate-${RANDOM}"
+          volume="woow-od-release-gate-data-${RANDOM}"
+          cleanup() {
+            local status=$?
+            if (( status != 0 )); then
+              docker logs "$container" >&2 || true
+            fi
+            docker rm -f "$container" >/dev/null 2>&1 || true
+            docker volume rm "$volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker volume create "$volume" >/dev/null
+          docker run -d --name "$container" --platform "$PLATFORM" \
+            -v "$volume:/data" "$IMAGE" >/dev/null
+          # OD is loopback-bound on 7456 inside the container; there is no
+          # in-image nginx, so the probe runs from inside the namespace.
+          for attempt in $(seq 1 90); do
+            if docker exec "$container" node -e "fetch('http://127.0.0.1:7456/api/health').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"; then
+              break
+            fi
+            if ! docker inspect -f '{{.State.Running}}' "$container" | grep -qx true; then
+              exit 1
+            fi
+            sleep 1
+            if [ "$attempt" = 90 ]; then
+              echo 'health endpoint did not become ready' >&2
+              exit 1
+            fi
+          done
+
+          docker exec --user 1001:1001 "$container" sh -ceu '
+            test "$(id -u)" = 1001
+            test "$(opencode --version)" = 1.18.29
+            test "$(command -v opencode)" = /opt/woow-opendesign/opencode/node_modules/.bin/opencode
+            ! command -v opencode-cli >/dev/null 2>&1
+            ! command -v pi >/dev/null 2>&1
+            ! command -v nginx >/dev/null 2>&1
+            test ! -e /usr/local/bin/pi
+            test ! -e /opt/woow-opendesign/pi-wrapper.mjs
+            test ! -e /opt/woow-opendesign/ha-pi-wrapper.mjs
+          '
+          docker cp tests/container-opencode-byok-e2e.mjs "$container:/tmp/container-opencode-byok-e2e.mjs"
+          docker exec "$container" node /tmp/container-opencode-byok-e2e.mjs
+          if docker logs "$container" 2>&1 | grep -Fq -- "$BYOK_FAKE_KEY"; then
+            echo 'fake BYOK key leaked to container logs' >&2
+            exit 1
+          fi
+          if docker exec "$container" sh -ceu '
+            if grep -R -I -F -q -- "$1" /data; then
+              exit 1
+            fi
+          ' sh "$BYOK_FAKE_KEY"; then
+            :
+          else
+            echo 'fake BYOK key leaked to /data persisted artifacts' >&2
+            exit 1
+          fi
+
+  publish-release:
+    if: github.ref_type == 'tag'
+    needs: [validate, smoke, release-preflight, release-architecture-gate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Read chart version
+        id: metadata
+        shell: bash
+        run: echo "version=$(./.github/scripts/chart-version.sh chart/Chart.yaml)" >> "$GITHUB_OUTPUT"
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - name: Log in to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish the immutable image
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          platforms: ${{ env.BUILD_PLATFORM }}
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE_REPOSITORY }}:${{ steps.metadata.outputs.version }}
+          build-args: |
+            BUILD_FROM=${{ env.BUILD_FROM }}
+            BUILD_ARCH=amd64
+            BUILD_VERSION=${{ steps.metadata.outputs.version }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
+            BUILD_DESCRIPTION=OpenDesign 0.21.1 for woow-k3s behind Nginx Proxy Manager
+            BUILD_NAME=Woow k3s OpenDesign
+            BUILD_REF=${{ github.sha }}
+            BUILD_REPOSITORY=${{ github.repository }}
+          cache-from: type=gha,scope=opendesign-amd64
+          cache-to: type=gha,scope=opendesign-amd64,mode=max
+      - name: Install checksum-pinned helm
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$RUNNER_TEMP/tools" "$HOME/.local/bin"
+          cd "$RUNNER_TEMP/tools"
+          curl --fail --silent --show-error --location -o helm.tgz \
+            "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum --check --strict
+          tar -xzf helm.tgz linux-amd64/helm
+          install -m 0755 linux-amd64/helm "$HOME/.local/bin/helm"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Package and publish the chart as an OCI artifact
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          helm package chart/ --destination "$RUNNER_TEMP/chart"
+          printf '%s' "$GHCR_PASSWORD" | helm registry login ghcr.io \
+            --username "$GHCR_USERNAME" --password-stdin
+          helm push "$RUNNER_TEMP/chart/opendesign-${VERSION}.tgz" "$CHART_OCI_REPOSITORY"
+          helm registry logout ghcr.io || true
+      - name: Record the published digest for values.yaml
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            echo "## Published release ${VERSION}"
+            echo
+            echo '| Artifact | Reference |'
+            echo '|---|---|'
+            echo "| Image | \`${IMAGE_REPOSITORY}:${VERSION}\` |"
+            echo "| Image digest | \`${DIGEST}\` |"
+            echo "| Chart | \`${CHART_OCI_REPOSITORY}/opendesign:${VERSION}\` |"
+            echo
+            echo 'Record the digest in `chart/values.yaml` as `image.digest` so deployments'
+            echo 'resolve by digest rather than by tag:'
+            echo
+            echo '```yaml'
+            echo 'image:'
+            echo "  digest: \"${DIGEST}\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

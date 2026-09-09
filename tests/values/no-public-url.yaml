@@ -1,0 +1,2 @@
+# Negative fixture: publicUrl is required. Rendering with this file MUST fail.
+publicUrl: ""

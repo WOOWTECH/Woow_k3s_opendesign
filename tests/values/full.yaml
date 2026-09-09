@@ -1,0 +1,14 @@
+# Full-surface render used by the chart lane: backup enabled, image pinned by
+# digest, NetworkPolicy on. This is the shape a real install should have.
+publicUrl: https://od-woow-k3s.woowtech.io
+
+image:
+  # Not a credential: this is the public GHCR digest of the pinned OpenDesign
+  # base image, reused here only to exercise the digest rendering branch.
+  digest: "sha256:441daca881e699657bacf28e0c27b16cd6be551dfff4bd63368dd74bec581f39"
+
+backup:
+  enabled: true
+
+networkPolicy:
+  enabled: true

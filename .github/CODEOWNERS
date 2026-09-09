@@ -1,2 +1,24 @@
-# All changes require review from WOOWTECH org members.
+# Every change requires review from the WOOWTECH owners.
+#
+# NOTE (unverified): a CODEOWNERS entry only has an effect when the owner
+# resolves to a GitHub user or a team with write access on this repository,
+# AND a branch protection rule on `main` requires code-owner review. Neither
+# could be confirmed from this workspace (the available token cannot read
+# /orgs/WOOWTECH/teams). Treat this file as intent until an org admin
+# confirms both. If `@WOOWTECH` does not resolve, replace it with a real
+# team slug such as `@WOOWTECH/platform`.
 * @WOOWTECH
+
+# Security-critical surfaces. Called out separately so a reviewer sees them
+# named in the PR, even though the catch-all above already covers them.
+/.github/                 @WOOWTECH
+/.github/workflows/       @WOOWTECH
+/.github/scripts/         @WOOWTECH
+/Dockerfile               @WOOWTECH
+/chart/values.yaml        @WOOWTECH
+/chart/values.schema.json @WOOWTECH
+/chart/templates/networkpolicy.yaml @WOOWTECH
+/chart/templates/configmap-nginx.yaml @WOOWTECH
+/rootfs/                  @WOOWTECH
+/runtime/                 @WOOWTECH
+/tests/validate.py        @WOOWTECH

@@ -1,0 +1,12 @@
+# Realistic install values: everything on, image resolved by tag.
+# Used by `helm lint`/`helm template` in CI so the required publicUrl guard is
+# exercised with a real value rather than skipped.
+#
+# NOTE: deliberately no `image.digest` here. A digest only resolves inside the
+# repository that holds it, so pinning nexu-io/od's base digest under
+# ghcr.io/woowtech/woow-k3s-opendesign would return MANIFEST_UNKNOWN forever.
+# The real digest is written into values.yaml by the release job, which reads
+# it from the buildx output for THIS repository.
+publicUrl: https://od-woow-k3s.woowtech.io
+backup:
+  enabled: true

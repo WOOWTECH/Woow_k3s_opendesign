@@ -1,0 +1,199 @@
+# Woow OpenDesign on woow-k3s.
+#
+# Installed into an EXISTING namespace (Rancher owns namespace creation here):
+#   helm -n pi-agent-woow install opendesign . -f my-values.yaml
+#
+# This chart creates NO namespace, NO Secret, NO ServiceAccount and NO RBAC.
+# It holds no credential of any kind: OpenDesign's BYOK keys are entered in the
+# browser and stay browser-local, the daemon binds to loopback so it needs no
+# API token, and authentication is done by the shared Nginx Proxy Manager
+# container (deployment/npm in this namespace), never by this chart.
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ── Required ───────────────────────────────────────────────────────────────
+# The public origin this instance is reached on THROUGH Nginx Proxy Manager,
+# e.g. https://od-woow-k3s.woowtech.io
+#
+# Drives OD_ALLOWED_ORIGINS and OD_PUBLIC_BASE_URL. There is deliberately no
+# default: a wrong origin silently disables OpenDesign's cross-site rejection,
+# so the chart REFUSES TO RENDER while this is empty and tells you so. That is
+# a loud, install-time failure by design -- unlike the old chart's
+# `__K3S_NODE_HOSTNAME__`, which rendered happily and was only rejected later
+# by the API server.
+publicUrl: ""
+
+# ── OpenDesign image ───────────────────────────────────────────────────────
+image:
+  repository: ghcr.io/woowtech/woow-k3s-opendesign
+  # Blank = use .Chart.Version (2.0.0). The literal "latest" is rejected.
+  tag: ""
+  # sha256:... -- when set it WINS over tag and the image is pulled by digest.
+  # The release process fills this in from the `docker buildx` output.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# The package is published public, as ghcr.io/woowtech/woow-k3s-pi-agent is
+# (the live pi-agent Deployments pull it with no pull secret).
+imagePullSecrets: []
+
+# ── nginx sidecar ──────────────────────────────────────────────────────────
+# Terminates the pod-network connection so the OpenDesign daemon can stay on
+# 127.0.0.1. It does NO authentication and NO path rewriting -- see
+# files/nginx.conf for the full list of things it must never grow.
+nginx:
+  image:
+    repository: nginx
+    tag: "1.27-alpine"
+    pullPolicy: IfNotPresent
+  # The only port reachable over the pod network.
+  port: 7457
+  # Reject mutating requests (anything but GET/HEAD/OPTIONS) that carry no
+  # Origin header. Keep this true: it closes the one gap left by normalising
+  # Host to the loopback form OpenDesign trusts unconditionally. Set it false
+  # only for non-browser automation that cannot send an Origin, and record why.
+  requireOriginOnMutation: true
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# ── OpenDesign daemon ──────────────────────────────────────────────────────
+opendesign:
+  # Loopback only. NOT a Service port and NOT a containerPort.
+  port: 7456
+  dataDir: /data/opendesign
+  timezone: Asia/Taipei
+
+  # Extra env for the OpenDesign container, for reviewed additions such as
+  # OD_ALLOWED_INTERNAL_HOSTS. OD_BIND_HOST, OD_PORT, OD_DATA_DIR,
+  # OD_ALLOWED_ORIGINS and OD_PUBLIC_BASE_URL are chart-owned and are rejected
+  # here; so are OD_API_TOKEN and OD_DISABLE_API_AUTH, which this deployment
+  # does not need and must never set.
+  extraEnv: {}
+
+  # Sized for one headless Chromium render at a time (the renderer holds a
+  # Semaphore(1)) with MAX_PIXELS 48,000,000 -- a 48 MP RGBA bitmap alone is
+  # ~183 MiB before Chromium's own overhead -- and MAX_OUTPUT_BYTES 128 MiB
+  # buffered per export. The request is what the pod actually needs while idle
+  # and serving the UI; the limit is the live release's proven ceiling.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+
+# ── Service ────────────────────────────────────────────────────────────────
+service:
+  # ClusterIP only. `type` is deliberately NOT configurable: NodePort or
+  # LoadBalancer would publish OpenDesign past Nginx Proxy Manager, which is
+  # the whole authentication boundary. values.schema.json rejects a `type` key.
+  port: 7457
+  annotations: {}
+
+# ── Storage ────────────────────────────────────────────────────────────────
+# NOTE: this cluster has TWO StorageClasses annotated is-default-class=true
+# (local-path and longhorn), so an omitted storageClassName is resolved by an
+# ambiguous tiebreak. Every PVC here names its class explicitly.
+persistence:
+  data:
+    # `longhorn` is reclaimPolicy Retain and allowVolumeExpansion true.
+    # Never longhorn-delete (Delete) or local-path (Delete, single node, no
+    # expansion) -- that is the posture that left the previous deployment's
+    # ~204 MiB of tenant data one `helm uninstall` from gone.
+    storageClassName: longhorn
+    size: 20Gi
+    accessModes:
+      - ReadWriteOnce
+    annotations:
+      helm.sh/resource-policy: keep
+
+# ── Backup ─────────────────────────────────────────────────────────────────
+# Longhorn has no working backup target on this cluster
+# (backuptargets/default reports available: false, zero recurringjobs), so the
+# chart ships its own tar-to-a-second-PVC CronJob rather than delegating.
+# This survives a bad `helm uninstall` or an accidental PVC delete. It does
+# NOT survive loss of the cluster -- for off-site durability configure a
+# Longhorn backup target or add an upload step.
+backup:
+  enabled: true
+  # 03:17 daily. CronJob schedules are evaluated in the cluster's timezone.
+  schedule: "17 3 * * *"
+  # Archives to keep on the backup PVC.
+  retain: 7
+  persistence:
+    storageClassName: longhorn
+    size: 20Gi
+    accessModes:
+      - ReadWriteOnce
+    annotations:
+      helm.sh/resource-policy: keep
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# ── NetworkPolicy ──────────────────────────────────────────────────────────
+# Modelled byte-for-byte on the five live pi-agent policies so the fleet stays
+# uniform. Port 7456 is deliberately absent: the daemon is bound to 127.0.0.1
+# and is not reachable over the pod network at all, so no rule can name it.
+# Kubelet probes are exempt from NetworkPolicy and hit the sidecar directly.
+networkPolicy:
+  enabled: true
+  # Pods allowed to reach the nginx sidecar. Same namespace, so this is a bare
+  # podSelector -- no namespaceSelector, no label to add elsewhere.
+  fromPodLabels:
+    app: npm
+  # Extra CIDRs allowed in (LAN admin/debug), matching the pi-agent fleet.
+  fromCIDRs:
+    - 192.168.0.0/16
+  # Egress: DNS to kube-dns, then everything EXCEPT the pod CIDR, the service
+  # CIDR, the LAN and the metadata IP.
+  egressExcept:
+    - 10.42.0.0/16
+    - 10.43.0.0/16
+    - 192.168.0.0/16
+    - 169.254.169.254/32
+
+# ── Probes ─────────────────────────────────────────────────────────────────
+# All three run against http://:7457/api/health on the nginx sidecar, which is
+# the only port on the pod network. OpenDesign's origin middleware exempts
+# health/version for monitoring probes, and a 200 there proves the whole chain
+# nginx -> 127.0.0.1:7456 -> daemon is up.
+# startup is generous: Chromium plus OpenDesign cold-starting on a freshly
+# attached Longhorn volume is slow (60 x 10s = 10 minutes of grace).
+probes:
+  startup:
+    periodSeconds: 10
+    failureThreshold: 60
+    timeoutSeconds: 5
+  readiness:
+    periodSeconds: 10
+    failureThreshold: 3
+    timeoutSeconds: 5
+  liveness:
+    periodSeconds: 30
+    failureThreshold: 5
+    timeoutSeconds: 10
+
+# ── Scheduling / misc ──────────────────────────────────────────────────────
+podAnnotations: {}
+podLabels: {}
+# Intentionally empty. Longhorn is distributed with dataLocality disabled;
+# `strategy: Recreate` is what handles the RWO single-attach constraint, not
+# node pinning. The old chart's `__K3S_NODE_HOSTNAME__` placeholder here is
+# exactly what made it uninstallable.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+terminationGracePeriodSeconds: 60
