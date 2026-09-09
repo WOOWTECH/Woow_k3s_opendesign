@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "Woow OpenDesign chart values",
+  "type": "object",
+  "required": ["publicUrl", "image", "nginx", "opendesign", "service", "persistence", "backup", "networkPolicy", "probes"],
+  "properties": {
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+
+    "publicUrl": {
+      "description": "https:// origin this instance is reached on through Nginx Proxy Manager. Empty passes the schema but the templates refuse to render, so the failure is a readable message rather than a malformed manifest.",
+      "type": "string",
+      "pattern": "^$|^https://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+(:[0-9]{1,5})?$"
+    },
+
+    "image": {
+      "type": "object",
+      "required": ["repository", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1, "not": { "pattern": "^localhost/" } },
+        "tag": { "type": "string", "not": { "pattern": "^(?i)latest$" } },
+        "digest": { "type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent"] }
+      }
+    },
+    "imagePullSecrets": { "type": "array" },
+
+    "nginx": {
+      "type": "object",
+      "required": ["image", "port", "requireOriginOnMutation", "resources"],
+      "properties": {
+        "image": {
+          "type": "object",
+          "required": ["repository", "tag"],
+          "properties": {
+            "repository": { "type": "string", "minLength": 1 },
+            "tag": { "type": "string", "minLength": 1, "not": { "pattern": "^(?i)latest$" } },
+            "pullPolicy": { "enum": ["Always", "IfNotPresent"] }
+          }
+        },
+        "port": { "type": "integer", "minimum": 1025, "maximum": 65535 },
+        "requireOriginOnMutation": { "type": "boolean" },
+        "resources": { "type": "object" }
+      }
+    },
+
+    "opendesign": {
+      "type": "object",
+      "required": ["port", "dataDir", "timezone", "resources"],
+      "properties": {
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "dataDir": { "type": "string", "pattern": "^/.+" },
+        "timezone": { "type": "string", "minLength": 1 },
+        "extraEnv": { "type": "object", "additionalProperties": { "type": ["string", "number", "boolean"] } },
+        "resources": { "type": "object" }
+      }
+    },
+
+    "service": {
+      "description": "type is intentionally absent: NodePort/LoadBalancer would bypass the NPM auth boundary.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port"],
+      "properties": {
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "annotations": { "type": "object" }
+      }
+    },
+
+    "persistence": {
+      "type": "object",
+      "required": ["data"],
+      "properties": { "data": { "$ref": "#/definitions/pvc" } }
+    },
+
+    "backup": {
+      "type": "object",
+      "required": ["enabled", "schedule", "retain", "persistence"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "schedule": { "type": "string", "minLength": 9 },
+        "retain": { "type": "integer", "minimum": 1 },
+        "persistence": { "$ref": "#/definitions/pvc" },
+        "resources": { "type": "object" }
+      }
+    },
+
+    "networkPolicy": {
+      "type": "object",
+      "required": ["enabled", "fromPodLabels", "egressExcept"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "fromPodLabels": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } },
+        "fromCIDRs": { "type": "array", "items": { "type": "string" } },
+        "egressExcept": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+      }
+    },
+
+    "probes": {
+      "type": "object",
+      "required": ["startup", "readiness", "liveness"],
+      "properties": {
+        "startup": { "$ref": "#/definitions/probe" },
+        "readiness": { "$ref": "#/definitions/probe" },
+        "liveness": { "$ref": "#/definitions/probe" }
+      }
+    },
+
+    "podAnnotations": { "type": "object" },
+    "podLabels": { "type": "object" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "priorityClassName": { "type": "string" },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 }
+  },
+
+  "definitions": {
+    "pvc": {
+      "type": "object",
+      "required": ["storageClassName", "size", "accessModes", "annotations"],
+      "properties": {
+        "storageClassName": {
+          "description": "Never omit: this cluster has two StorageClasses claiming is-default-class.",
+          "type": "string",
+          "minLength": 1
+        },
+        "size": { "type": "string", "pattern": "^[0-9]+(Mi|Gi|Ti)$" },
+        "accessModes": { "type": "array", "minItems": 1, "items": { "enum": ["ReadWriteOnce", "ReadWriteMany", "ReadOnlyMany"] } },
+        "annotations": {
+          "type": "object",
+          "required": ["helm.sh/resource-policy"],
+          "properties": { "helm.sh/resource-policy": { "const": "keep" } }
+        }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "required": ["periodSeconds", "failureThreshold"],
+      "properties": {
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

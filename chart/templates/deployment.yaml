@@ -1,0 +1,142 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "opendesign.fullname" . }}
+  labels:
+    {{- include "opendesign.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # RWO Longhorn volume: the old pod must detach before the new one attaches.
+  # This, not a nodeSelector, is what handles single-attach on rollout.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "opendesign.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Rolls the pod when either ConfigMap changes, exactly as the live
+        # pi-agent Deployments do (they carry checksum/nginx).
+        checksum/nginx: {{ include (print $.Template.BasePath "/configmap-nginx.yaml") . | sha256sum }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "opendesign.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      # No RBAC objects at all: default ServiceAccount, token not mounted.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: opendesign
+          image: {{ include "opendesign.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # No containerPort for {{ .Values.opendesign.port }} on purpose: the
+          # daemon binds 127.0.0.1 and is not reachable over the pod network.
+          # Declaring it would advertise a socket that does not exist there.
+          envFrom:
+            - configMapRef:
+                name: {{ include "opendesign.fullname" . }}-config
+          securityContext:
+            # PID 1 must chown the root-owned Longhorn mount before dropping
+            # to uid 1001 via su-exec; that is the whole reason for uid 0.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID", "KILL"]
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.opendesign.dataDir }}
+          resources:
+            {{- toYaml .Values.opendesign.resources | nindent 12 }}
+          # No probes here. The daemon is loopback-only, so an httpGet from
+          # the kubelet (which arrives on the pod IP) could never reach it.
+          # The sidecar's probes cover the whole chain instead.
+        - name: nginx
+          image: {{ include "opendesign.nginxImage" . | quote }}
+          imagePullPolicy: {{ .Values.nginx.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.nginx.port }}
+              protocol: TCP
+          securityContext:
+            runAsUser: 101
+            runAsGroup: 101
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: nginx-config
+              mountPath: /usr/share/nginx/od-export-bridge.js
+              subPath: od-export-bridge.js
+              readOnly: true
+            # readOnlyRootFilesystem: every nginx temp path and the pid file
+            # are redirected to the ROOT of this /tmp emptyDir -- NOT a
+            # subdirectory. nginx never creates a pid file's parent dir, so a
+            # nested layout crash-loops; see the header of chart/files/nginx.conf.
+            - name: tmp
+              mountPath: /tmp
+          # /api/health is exempted from OpenDesign's origin middleware for
+          # monitoring probes, and a 200 proves nginx -> 127.0.0.1:{{ .Values.opendesign.port }} -> daemon.
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          resources:
+            {{- toYaml .Values.nginx.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "opendesign.fullname" . }}-data
+        - name: nginx-config
+          configMap:
+            name: {{ include "opendesign.fullname" . }}-nginx
+        - name: tmp
+          emptyDir: {}

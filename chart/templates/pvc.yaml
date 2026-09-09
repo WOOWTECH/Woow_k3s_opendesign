@@ -1,0 +1,42 @@
+{{/*
+One data volume. HOME is $OD_DATA_DIR/home, so the old chart's second
+"home" PVC is folded in here: one volume, one restore unit, no way for the
+two to drift.
+storageClassName is ALWAYS set explicitly -- this cluster has two
+StorageClasses annotated is-default-class=true (local-path and longhorn), so
+omitting it resolves by an ambiguous tiebreak.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "opendesign.fullname" . }}-data
+  labels:
+    {{- include "opendesign.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml (required "persistence.data.annotations is required and must keep helm.sh/resource-policy: keep" .Values.persistence.data.annotations) | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.data.accessModes | nindent 4 }}
+  storageClassName: {{ required "persistence.data.storageClassName must be set explicitly (two StorageClasses on this cluster claim is-default-class)" .Values.persistence.data.storageClassName | quote }}
+  resources:
+    requests:
+      storage: {{ required "persistence.data.size is required" .Values.persistence.data.size | quote }}
+{{- if .Values.backup.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "opendesign.fullname" . }}-backup
+  labels:
+    {{- include "opendesign.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+  annotations:
+    {{- toYaml (required "backup.persistence.annotations is required and must keep helm.sh/resource-policy: keep" .Values.backup.persistence.annotations) | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.backup.persistence.accessModes | nindent 4 }}
+  storageClassName: {{ required "backup.persistence.storageClassName must be set explicitly" .Values.backup.persistence.storageClassName | quote }}
+  resources:
+    requests:
+      storage: {{ required "backup.persistence.size is required" .Values.backup.persistence.size | quote }}
+{{- end }}

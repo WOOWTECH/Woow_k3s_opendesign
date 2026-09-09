@@ -1,0 +1,30 @@
+{{- include "opendesign.validateExtraEnv" . -}}
+{{- $public := include "opendesign.publicUrl" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "opendesign.fullname" . }}-config
+  labels:
+    {{- include "opendesign.labels" . | nindent 4 }}
+data:
+  # Loopback bind. server.js:1740 refuses to start on a non-loopback host
+  # unless OD_API_TOKEN is set or OD_DISABLE_API_AUTH=1; loopback is the only
+  # bind that needs neither, and it makes the daemon socket unreachable over
+  # the pod network entirely. Nginx Proxy Manager is the auth boundary.
+  # OD_API_TOKEN and OD_DISABLE_API_AUTH are deliberately ABSENT.
+  OD_BIND_HOST: "127.0.0.1"
+  OD_PORT: {{ .Values.opendesign.port | quote }}
+  OD_DATA_DIR: {{ .Values.opendesign.dataDir | quote }}
+  # The reverse-proxy escape hatch in origin-validation.js: a browser request
+  # carrying exactly this Origin is trusted; anything else falls through to
+  # isAllowedBrowserOrigin and is rejected. Never "*", never empty.
+  OD_ALLOWED_ORIGINS: {{ $public | quote }}
+  # Without this the MCP OAuth redirect_uri is registered as http:// from
+  # internal request headers while the browser redirects over https://,
+  # which the auth provider answers with invalid_request.
+  OD_PUBLIC_BASE_URL: {{ $public | quote }}
+  NODE_ENV: "production"
+  TZ: {{ .Values.opendesign.timezone | quote }}
+{{- range $k, $v := .Values.opendesign.extraEnv }}
+  {{ $k }}: {{ $v | quote }}
+{{- end }}

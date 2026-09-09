@@ -1,0 +1,72 @@
+{{- $fullname := include "opendesign.fullname" . -}}
+{{- $public := include "opendesign.publicUrl" . -}}
+Woow OpenDesign {{ .Chart.AppVersion }} (chart {{ .Chart.Version }}) installed as
+release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Nothing is publicly reachable yet. The chart deliberately owns no ingress: the
+only path in is the shared Nginx Proxy Manager container, which is also the
+only thing that authenticates. Two steps remain, and NEITHER is chart-owned.
+
+1) cloudflared -- add the hostname to the pi-tunnel release, via Helm:
+
+     helm -n {{ .Release.Namespace }} upgrade pi-tunnel <chart> \
+       --reuse-values --set 'ingress[N].hostname={{ trimPrefix "https://" $public }}' \
+       --set 'ingress[N].service=http://npm.{{ .Release.Namespace }}.svc.cluster.local:80'
+
+   NEVER `kubectl patch` the pi-tunnel-cloudflared ConfigMap. That ConfigMap
+   once carried 10 hand-appended hostnames while Helm knew about 2, and a
+   plain `helm upgrade` would have 404'd four public hostnames.
+
+2) Nginx Proxy Manager UI (https://pi-agent-npm.woowtech.io) -> Proxy Hosts ->
+   Add Proxy Host:
+
+     Domain Names      : {{ trimPrefix "https://" $public }}
+     Scheme            : http
+     Forward Hostname  : {{ $fullname }}.{{ .Release.Namespace }}.svc.cluster.local
+     Forward Port      : {{ .Values.service.port }}
+     Websockets Support: ON      <-- required, OpenDesign streams over WS
+     Block Common Exploits: ON
+     Access List       : the same basic-auth list the pi-agent hosts use
+     SSL               : request/attach a cert as the sibling hosts do
+
+   Nothing in the npm Deployment, Service or NetworkPolicy needs to change.
+
+Check it came up:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ $fullname }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fullname }} 7457:{{ .Values.service.port }}
+  curl -s localhost:7457/api/health     # expect {"ok":true}
+
+Security posture, so nobody "fixes" it later:
+  * The daemon binds 127.0.0.1:{{ .Values.opendesign.port }} and is unreachable over the pod
+    network. OD_API_TOKEN and OD_DISABLE_API_AUTH are both ABSENT, and that is
+    correct -- unreachable-by-construction beats any token.
+  * OD_ALLOWED_ORIGINS is {{ $public }}. A cross-site request with any other
+    Origin is rejected by the daemon.
+{{- if .Values.nginx.requireOriginOnMutation }}
+  * The sidecar returns 403 for any non-GET/HEAD/OPTIONS request with no
+    Origin header. Flip nginx.requireOriginOnMutation to false only for
+    non-browser automation, and record why.
+{{- else }}
+  * WARNING: nginx.requireOriginOnMutation is FALSE. Mutating requests with no
+    Origin header reach the daemon and are accepted via its loopback-Host
+    branch. You are relying on the NPM Access List alone.
+{{- end }}
+  * This chart holds no credential. BYOK keys are entered in the browser and
+    stay browser-local.
+
+{{ if .Values.backup.enabled -}}
+Backup: CronJob {{ $fullname }}-backup runs "{{ .Values.backup.schedule }}", keeping {{ .Values.backup.retain }}
+archives on PVC {{ $fullname }}-backup. Restore:
+
+  kubectl -n {{ .Release.Namespace }} scale deploy/{{ $fullname }} --replicas=0
+  # run a throwaway pod mounting both PVCs, then:
+  #   tar xzf /backup/opendesign-<ts>.tar.gz -C /data
+  kubectl -n {{ .Release.Namespace }} scale deploy/{{ $fullname }} --replicas=1
+
+This copy lives in the same Longhorn cluster: it survives a bad
+`helm uninstall` or an accidental PVC delete, NOT loss of the cluster.
+{{- else -}}
+WARNING: backup.enabled is false and this cluster's Longhorn backup target
+reports available: false. Nothing is backing up PVC {{ $fullname }}-data.
+{{- end }}

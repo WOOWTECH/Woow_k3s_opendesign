@@ -1,0 +1,27 @@
+apiVersion: v2
+name: opendesign
+description: >-
+  Woow OpenDesign on woow-k3s: the OpenDesign daemon (loopback-bound) plus a
+  filter-free nginx sidecar, installed into the EXISTING pi-agent-woow
+  namespace and published exclusively through the shared Nginx Proxy Manager
+  container, which is the sole authentication boundary.
+type: application
+
+# One number for the chart and the image tag. `image.tag` defaults to this.
+version: 2.0.0
+# The upstream OpenDesign version baked into the image (ghcr.io/nexu-io/od).
+appVersion: "0.21.1"
+
+kubeVersion: ">=1.24.0-0"
+
+keywords:
+  - open-design
+  - opendesign
+  - k3s
+  - woowtech
+home: https://github.com/WOOWTECH/Woow_k3s_opendesign
+sources:
+  - https://github.com/WOOWTECH/Woow_k3s_opendesign
+maintainers:
+  - name: WoowTech
+    url: https://github.com/WOOWTECH

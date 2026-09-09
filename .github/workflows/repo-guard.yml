@@ -1,52 +1,91 @@
 # =============================================================================
-# repo-guard.yml — 倉庫污染防護 CI (OpenDesign)
+# repo-guard.yml -- anti-pollution check
 # =============================================================================
-# Checks for OpenClaw or Hermes files that don't belong in this repo.
+# This repository has previously been polluted by files belonging to sibling
+# WOOWTECH projects (OpenClaw, Hermes). It also used to ship components that
+# were deliberately deleted in the 2.0.0 rewrite: the ttyd/Flask console, the
+# od-mcp sidecar, the from-source Dockerfile.open-design, and a Python
+# renderer. This job blocks all of them from coming back by PATH, not by
+# grepping file contents -- CHANGELOG.md and the READMEs must stay free to
+# name the removed components when explaining why they were removed.
 
-name: Repo Guard — Anti-Pollution Check
+name: Repo Guard - Anti-Pollution Check
 
 on:
   push:
-    branches: [main, k3s]
+    branches: [main]
   pull_request:
-    branches: [main, k3s]
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   check-pollution:
-    name: Check for cross-repo pollution
-    runs-on: ubuntu-latest
+    name: Check for cross-repo pollution and removed components
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Scan for cross-repo pollution markers
+      - name: Scan for pollution and re-added removed components
+        shell: bash
         run: |
-          echo "🔍 Scanning for cross-repo pollution markers..."
-          FOUND=0
+          set -Eeuo pipefail
+          found=0
 
+          # Cross-repo pollution (sibling WOOWTECH projects).
           for dir in openclaw-k3s-paas openclaw-console setup-wizard hermes; do
-            if [ -d "$dir" ]; then
-              echo "❌ POLLUTION: directory '$dir/' does not belong in OpenDesign"
-              FOUND=1
+            if [ -e "$dir" ]; then
+              echo "POLLUTION: '$dir/' does not belong in Woow_k3s_opendesign"
+              found=1
             fi
           done
-
           for file in Dockerfile.nerve Dockerfile.custom Dockerfile.hermes-agent; do
-            if [ -f "$file" ]; then
-              echo "❌ POLLUTION: file '$file' does not belong in OpenDesign"
-              FOUND=1
+            if [ -e "$file" ]; then
+              echo "POLLUTION: '$file' does not belong in Woow_k3s_opendesign"
+              found=1
             fi
           done
-
-          FOREIGN=$(find . -maxdepth 3 \( -name "*openclaw*" -o -name "*hermes*" \) -not -path "./.git/*" -not -name "*.md" 2>/dev/null)
-          if [ -n "$FOREIGN" ]; then
-            echo "❌ POLLUTION: foreign files detected:"
-            echo "$FOREIGN" | sed 's/^/    /'
-            FOUND=1
+          foreign=$(find . -maxdepth 3 \( -name '*openclaw*' -o -name '*hermes*' \) \
+            -not -path './.git/*' -not -name '*.md' 2>/dev/null || true)
+          if [ -n "$foreign" ]; then
+            echo "POLLUTION: foreign files detected:"
+            echo "$foreign" | sed 's/^/    /'
+            found=1
           fi
 
-          if [ "$FOUND" -eq 1 ]; then
-            echo "⛔ Cross-repo pollution detected. Push blocked."
+          # Components deleted in 2.0.0. Re-adding any of them is a design
+          # regression, not a merge accident. See CHANGELOG.md 2.0.0.
+          for path in \
+            console \
+            od-mcp \
+            Dockerfile.open-design \
+            headless-renderer.py \
+            chart/templates/namespace.yaml \
+            chart/templates/secret.yaml \
+            runtime/pi \
+            rootfs/usr/local/bin/pi \
+          ; do
+            if [ -e "$path" ]; then
+              echo "REMOVED COMPONENT: '$path' was deleted in 2.0.0 and must not return"
+              found=1
+            fi
+          done
+
+          removed_templates=$(find chart/templates -maxdepth 1 \
+            \( -name 'console-*' -o -name 'mcp-*' -o -name '*ttyd*' \) 2>/dev/null || true)
+          if [ -n "$removed_templates" ]; then
+            echo "REMOVED COMPONENT: console/mcp/ttyd templates must not return:"
+            echo "$removed_templates" | sed 's/^/    /'
+            found=1
+          fi
+
+          if [ "$found" -eq 1 ]; then
+            echo "Repo guard failed. Push blocked."
             exit 1
           fi
 
-          echo "✅ No cross-repo pollution detected."
+          echo "Repo guard: clean."

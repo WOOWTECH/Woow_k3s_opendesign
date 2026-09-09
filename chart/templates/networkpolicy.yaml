@@ -1,0 +1,61 @@
+{{- if .Values.networkPolicy.enabled }}
+{{/*
+Modelled byte-for-byte on the five live pi-agent policies.
+Port {{ .Values.opendesign.port }} (the daemon) is deliberately absent from
+ingress: it is bound to 127.0.0.1 and is not reachable over the pod network at
+all, so no rule can or should name it. Kubelet probes are exempt from
+NetworkPolicy and hit the sidecar port directly.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "opendesign.fullname" . }}
+  labels:
+    {{- include "opendesign.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "opendesign.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Nginx Proxy Manager, same namespace -- a bare podSelector, no
+    # namespaceSelector and no label to add anywhere else.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.fromPodLabels | nindent 14 }}
+      ports:
+        - port: {{ .Values.nginx.port }}
+          protocol: TCP
+    {{- with .Values.networkPolicy.fromCIDRs }}
+    # LAN admin/debug, same as the pi-agent fleet.
+    - from:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - port: {{ $.Values.nginx.port }}
+          protocol: TCP
+    {{- end }}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- toYaml .Values.networkPolicy.egressExcept | nindent 14 }}
+{{- end }}

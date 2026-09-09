@@ -1,0 +1,129 @@
+{{- if .Values.backup.enabled }}
+{{- $retain := int .Values.backup.retain -}}
+{{- if lt $retain 1 }}{{ fail "backup.retain must be >= 1" }}{{ end -}}
+{{/*
+Longhorn has no working backup target on this cluster
+(backuptargets/default reports available: false, zero recurringjobs), so the
+chart ships its own. It uses the OpenDesign image itself: already
+digest-pinned, already on the node, and its Alpine busybox has tar/gzip/xargs
+(verified inside ghcr.io/nexu-io/od:0.21.1). No extra image to pin or pull.
+*/}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "opendesign.fullname" . }}-backup
+  labels:
+    {{- include "opendesign.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            {{- include "opendesign.labels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: OnFailure
+          automountServiceAccountToken: false
+          # The container runs as 1001 with every capability dropped, so unlike
+          # the main pod (root + CHOWN) it cannot fix volume ownership itself.
+          # A freshly provisioned Longhorn PVC is root:root, so without fsGroup
+          # the very first `tar czf /backup/...` fails with permission denied
+          # and the CronJob has never produced a single archive.
+          # OnRootMismatch keeps this cheap: the backup volume is chowned once,
+          # and the 20Gi data volume is skipped (its root already matches, and
+          # it is mounted read-only anyway) instead of being walked every night.
+          securityContext:
+            fsGroup: 1001
+            fsGroupChangePolicy: OnRootMismatch
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          affinity:
+            # REQUIRED, never "preferred". A Longhorn RWO volume attaches to
+            # exactly one node; several pods on THAT node may share it, so the
+            # backup Job must be co-scheduled with the OpenDesign pod.
+            # Weakening this to preferred makes the Job hang on volume attach.
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - topologyKey: kubernetes.io/hostname
+                  labelSelector:
+                    matchLabels:
+                      {{- include "opendesign.selectorLabels" . | nindent 22 }}
+          containers:
+            - name: backup
+              image: {{ include "opendesign.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # Overrides the image entrypoint; this never starts the daemon.
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  retain={{ $retain }}
+                  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+                  archive="/backup/opendesign-${ts}.tar.gz"
+                  echo "[backup] creating ${archive}"
+                  # busybox tar exits 1 for delayed/soft errors such as a file
+                  # changing while it is read, which is expected against a live
+                  # data dir. Anything above 1 is a real failure.
+                  #
+                  # lost+found is the ext4 artefact at the root of the Longhorn
+                  # volume: root:root 0700, unreadable to uid 1001. Left in, it
+                  # made EVERY run exit 1, permanently burning the one signal
+                  # that is supposed to mean "a file moved under us". Excluding
+                  # it costs nothing (it is always empty) and gives rc=1 its
+                  # meaning back.
+                  rc=0
+                  tar czf "${archive}" \
+                    --exclude='opendesign/lost+found' \
+                    -C /data opendesign || rc=$?
+                  if [ "${rc}" -gt 1 ]; then
+                    echo "[backup] tar failed with rc=${rc}" >&2
+                    rm -f -- "${archive}"
+                    exit "${rc}"
+                  fi
+                  # Prove the archive is readable before it counts as a backup.
+                  if ! tar tzf "${archive}" >/dev/null 2>&1; then
+                    echo "[backup] archive failed verification, discarding" >&2
+                    rm -f -- "${archive}"
+                    exit 1
+                  fi
+                  echo "[backup] ok: $(ls -l "${archive}")"
+                  echo "[backup] pruning to newest ${retain}"
+                  ls -1t /backup/opendesign-*.tar.gz \
+                    | tail -n "+$((retain + 1))" \
+                    | xargs -r rm -f --
+                  echo "[backup] retained:"
+                  ls -1t /backup/opendesign-*.tar.gz
+              securityContext:
+                runAsUser: 1001
+                runAsGroup: 1001
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: data
+                  mountPath: /data/opendesign
+                  readOnly: true
+                - name: backup
+                  mountPath: /backup
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: {{ include "opendesign.fullname" . }}-data
+                readOnly: true
+            - name: backup
+              persistentVolumeClaim:
+                claimName: {{ include "opendesign.fullname" . }}-backup
+{{- end }}

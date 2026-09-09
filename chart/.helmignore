@@ -1,0 +1,30 @@
+# Patterns to ignore when packaging the chart.
+# The chart lives at the repository root, so everything that is part of the
+# IMAGE or the TESTS rather than the DEPLOYMENT is excluded here.
+.DS_Store
+.git/
+.github/
+.gitignore
+.helmignore
+*.tmproj
+.tmproj
+.project
+.idea/
+.vscode/
+OWNERS
+
+# Image build surface -- shipped to the container registry, not to Helm.
+Dockerfile
+Dockerfile.*
+rootfs/
+runtime/
+
+# Test + docs surface.
+tests/
+ci/
+docs/
+*.md
+
+# Original Kustomize manifests kept in git history / other branches;
+# this chart is the authoritative deployment surface.
+k8s-manifests/

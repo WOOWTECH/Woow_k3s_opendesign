@@ -1,0 +1,7 @@
+# Minimal render: backup disabled (7 objects instead of 8) and the image
+# referenced by tag rather than digest, so both branches of the image helper
+# are exercised by the suite.
+publicUrl: https://od-woow-k3s.woowtech.io
+
+backup:
+  enabled: false
