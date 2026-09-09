@@ -114,6 +114,29 @@ jobs:
             BUILD_REPOSITORY=${{ github.repository }}
           cache-from: type=gha,scope=opendesign-amd64
           cache-to: type=gha,scope=opendesign-amd64,mode=max
+      # container-smoke.sh sources tests/lib/layout.sh, which REQUIRES
+      # tests/.artifacts/nginx.conf and tests/.artifacts/od-export-bridge.js.
+      # Those are rendered out of the chart ConfigMap by extract-chart-assets.py
+      # and are gitignored, so they exist only where something has run it.
+      # tests/run.sh does that at lane 0 — but that runs in the `validate` job,
+      # on a different runner. This job checked out a clean tree and went
+      # straight to the smoke script, so the layout guard failed the build
+      # before a single container started.
+      - name: Install chart-extraction tooling
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 -m pip install --break-system-packages PyYAML==6.0.2
+          mkdir -p "$HOME/.local/bin" "$RUNNER_TEMP/smoke-tools"
+          cd "$RUNNER_TEMP/smoke-tools"
+          curl --fail --silent --show-error --location -o helm.tgz \
+            "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum --check --strict
+          tar -xzf helm.tgz linux-amd64/helm
+          mv linux-amd64/helm "$HOME/.local/bin/helm"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Extract chart assets
+        run: python3 tests/lib/extract-chart-assets.py
       - name: Two-container pod smoke (daemon plus nginx sidecar)
         # Reproduces the k8s topology: OD on loopback 7456, nginx sidecar on 7457.
         run: ./tests/container-smoke.sh woow-k3s-opendesign:smoke
