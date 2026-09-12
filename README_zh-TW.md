@@ -69,7 +69,7 @@ nginx sidecar 的存在只有兩個理由：終結 Pod 網路連線，並把 `Ho
 | 所有節點皆為 `amd64`（映像只出 amd64） | 4／4 節點皆為 `amd64` |
 | Helm ≥ 3.8（支援 OCI） | 用戶端條件 |
 | OpenDesign 的公開網域與 Cloudflare DNS／tunnel 路由 | **尚未建立。** 必須由維運人員先選名並建立，見下方 |
-| `ghcr.io/woowtech/woow-k3s-opendesign` 已發佈且為公開 | **尚未發佈。** 第一個 `v2.0.0` tag 才會發佈；之後需組織管理員手動確認套件為 public（如同 `woow-k3s-pi-agent`） |
+| `ghcr.io/woowtech/woow-k3s-opendesign` 已發佈且為公開 | 已發佈 `2.0.1`，可匿名拉取（與 `woow-k3s-pi-agent` 相同）。OCI chart 為 `oci://ghcr.io/woowtech/charts/opendesign:2.0.1` |
 
 > 本叢集有**兩個** StorageClass 被標為預設（`local-path` 與 `longhorn`）。PVC 若
 > 省略 `storageClassName`，選誰由不確定的 tiebreak 決定。因此本 chart 每一個 PVC
@@ -80,7 +80,9 @@ nginx sidecar 的存在只有兩個理由：終結 Pod 網路連線，並把 `Ho
 chart 位於 `chart/`，安裝進既有 namespace，且不含任何密文。
 
 ```bash
-# 1. 最小 values。publicUrl 為必填，且必須是 https://
+# 1. 你的 values。publicUrl 必須設定：chart 預設值是一個 example.com 網域，
+#    好讓「什麼都不給」也能渲染；而它對不上任何真實瀏覽器來源，所以忘了改
+#    會直接壞掉（fail closed），不會變成什麼都信任。
 cat > od-values.yaml <<'YAML'
 publicUrl: "https://od-woow-k3s.woowtech.io"   # 你在 Cloudflare + NPM 建立的網域
 image:
@@ -92,8 +94,17 @@ helm -n pi-agent-woow install od ./chart -f od-values.yaml
 
 # 3. 或直接從 GHCR 安裝，不必 checkout
 helm -n pi-agent-woow install od \
-  oci://ghcr.io/woowtech/charts/opendesign --version 2.0.0 -f od-values.yaml
+  oci://ghcr.io/woowtech/charts/opendesign --version 2.0.1 -f od-values.yaml
+
+# 4. 或從 GitHub 原始碼 tarball 安裝（適合離線審查流程）
+curl -fsSL https://github.com/WOOWTECH/Woow_k3s_opendesign/archive/refs/tags/v2.0.1.tar.gz \
+  | tar -xz
+helm -n pi-agent-woow install od ./Woow_k3s_opendesign-2.0.1/chart -f od-values.yaml
 ```
+
+第 3、4 種方式的版本必須是 GHCR 上真的存在的版本。`image.tag` 預設等於 chart 版本，
+所以尚未打 tag 發佈的 chart 版本不會有對應映像：這種情況請改釘 `image.digest`
+（或 `image.tag`）。
 
 安裝前務必先渲染並做伺服器端 dry-run：
 
@@ -105,8 +116,34 @@ helm -n pi-agent-woow template od ./chart -f od-values.yaml | \
 `--dry-run=server` 正是能在 1.x 時代就抓到那個佔位符錯誤的檢查。請照做；也請絕對
 不要直接 `apply` 渲染結果——chart 是唯一的寫入者。
 
-**解除安裝不會刪資料。** 兩個 PVC 都帶 `helm.sh/resource-policy: keep`，且位於
-`Retain` 的 StorageClass 上。
+### 驗證
+
+```bash
+kubectl -n pi-agent-woow rollout status deploy/od
+helm -n pi-agent-woow test od          # 唯讀：經 Service 打兩個 GET
+```
+
+`helm test` 會起一個短命 Pod，經 Service 對 `/api/health` 與 `/api/version` 各發一個
+GET——與 NPM 走的是同一條路，所以通過就代表 Service → sidecar `:7457` →
+`127.0.0.1:7456` → daemon 整條鏈是通的。它不掛任何 volume、不寫任何東西。這個 hook
+Pod **刻意不帶** chart 的 selector 標籤：帶了就會被算進 Service 的 EndpointSlice，
+在它存活期間吃掉一部分真實流量。
+
+`networkPolicy.enabled: true` 時，hook 還需要 `networkPolicy.allowHelmTest: true`；
+它只會在 7457 埠多加一個 ingress 來源（本 release 的 hook Pod），不動任何 pod template。
+
+每個 GET 都會重試（`helmTest.retries`，預設 15 次、間隔 2 秒）。這不是湊數：hook Pod
+在執行前幾秒才被建立，而放行它的 NetworkPolicy 是以「Pod IP 的 ipset」實作的，policy
+controller 需要時間學到這個 IP；太早連線會被 reject，症狀看起來就跟 Service 壞掉一模
+一樣。實測只試一次的話，連續執行 `helm test` 大約有一半會失敗。
+
+hook Pod 在跑完後會留著（`helm.sh/hook-delete-policy: before-hook-creation`），所以
+`kubectl -n pi-agent-woow logs od-test-connection` 還看得到它當時看到什麼；下一次
+`helm test` 會把它換掉。
+
+**解除安裝不會刪資料。** `keepOnUninstall: true`（預設）會讓兩個 PVC——以及由 chart
+建立的 extra-env Secret——都帶上 `helm.sh/resource-policy: keep`，且位於 `Retain` 的
+StorageClass 上。
 
 ## 對外發佈（chart 範圍外，由維運人員執行）
 
@@ -136,15 +173,25 @@ chart 刻意不管 `pi-agent-woow` 以外的任何東西。以下兩步是你的
 
 | 鍵 | 預設 | 說明 |
 |---|---|---|
-| `publicUrl` | `""` | **必填。** 決定 `OD_ALLOWED_ORIGINS` 與 `OD_PUBLIC_BASE_URL`。空值或非 `https://` 會渲染失敗。 |
+| `publicUrl` | `https://opendesign.example.com` | **請設定。** 決定 `OD_ALLOWED_ORIGINS` 與 `OD_PUBLIC_BASE_URL`。預設是 example 網域，好讓 chart 自己的預設值可以 render／lint／kubeconform；它對不上任何真實來源，所以是 fail closed，且 `NOTES.txt` 會在你還沒改時大聲警告。填**空字串**、或不是「沒有路徑的 `https://` origin」，都是硬性渲染失敗。 |
+| `keepOnUninstall` | `true` | 為兩個 PVC 與（由 chart 建立的）extra-env Secret 加上 `helm.sh/resource-policy: keep`。只有丟棄用的測試 release 才該設 `false`。 |
 | `image.digest` | `""` | `sha256:...`。有值時優先於 `image.tag`。正式環境請設定。 |
-| `image.tag` | chart 版本 | `latest` 會被 schema 與 `tests/validate.py` 拒絕。 |
+| `image.tag` | chart 版本 | 會浮動的 tag 會被 schema 與 `tests/validate.py` 拒絕。 |
 | `nginx.requireOriginOnMutation` | `true` | sidecar 對沒有 `Origin` 的 POST／PUT／PATCH／DELETE 回 403。對瀏覽器正確；會擋掉不送 `Origin` 的非瀏覽器用戶端。 |
 | `persistence.data.size` | `20Gi` | `longhorn` 支援線上擴容。 |
 | `backup.enabled`／`.schedule`／`.retain` | `true`／`17 3 * * *`／`7` | |
-| `opendesign.extraEnv` | `{}` | 僅供經審查的追加項；chart 自有的變數會被拒絕。 |
+| `opendesign.extraEnv` | `{}` | 僅供經審查的追加項；chart 自有的變數會被拒絕。**會以明文渲染進 `-config` ConfigMap——絕不可放金鑰。** |
+| `opendesign.rejectSecretShapedExtraEnv` | `false` | 設 `true` 時，`extraEnv` 裡任何 `*_API_KEY`／`*_TOKEN`／`*_SECRET`／`*_PASSWORD` 都會讓渲染失敗。目前預設 `false`，唯一原因是 live release 還在用這條路傳一把金鑰，見 [docs/MIGRATION.md](docs/MIGRATION.md)。 |
+| `opendesign.extraEnvSecret.enabled` | `false` | 設 `true` 會在 OpenDesign 容器加上 `envFrom.secretRef`，金鑰就不會經過 ConfigMap。這會改動 pod template，因此會滾動一次 Pod。 |
+| `opendesign.extraEnvSecret.create` | `false` | `false` = Secret 已經存在，chart 只引用它（建議形狀）。`true` 則由 chart 依 `.data` 渲染，每個值都有 `required()`。兩種模式與欄位見 [examples/secrets.example.yaml](examples/secrets.example.yaml)。 |
+| `networkPolicy.allowHelmTest` | `false` | 設 `true` 會為 `helm test` hook Pod 多開一個 ingress 來源。NetworkPolicy 開著時，`helm test` 需要它。 |
+| `helmTest.enabled` | `true` | 是否附帶唯讀的 `helm test` hook。 |
 
-沒有 `secrets:` 區塊，也沒有 `service.type`。兩者都是刻意移除，理由見〈安全〉。
+仍然沒有 `secrets:` 區塊，也沒有 `service.type`。Secret 只會被「引用」，或在明確
+opt-in 下才由 chart 建立，理由見〈安全〉。
+
+正在運行的那個 release 的 values（不含密文）已提交在
+[`deploy/woow-k3s/opendesign.yaml`](deploy/woow-k3s/opendesign.yaml)。
 
 ## 匯出能力
 
@@ -206,14 +253,29 @@ Deployment 使用 `strategy: Recreate`，因為資料卷是 Longhorn RWO，無�
 請把發佈作業印出的 digest 填進 `image.digest`。改動 nginx ConfigMap 會透過
 `checksum/nginx` annotation 自動滾動 Pod。
 
+**要升級「已經在跑」的那個 release、而且不接受滾動**時：live 的 values（不含密文）
+已提交在 [`deploy/woow-k3s/opendesign.yaml`](deploy/woow-k3s/opendesign.yaml)，而
+
+```bash
+./deploy/woow-k3s/verify-live-render.sh        # 唯讀
+```
+
+會在你執行 `helm upgrade` 之前，先證明這個 chart 渲染出來的東西跟叢集上現有的一模
+一樣——先比 `helm get manifest`，再逐欄位比對 live 的 API 物件。有兩種改動一定會滾動
+Pod，而且是刻意的：動 chart 版本（`helm.sh/chart` 是 pod template 標籤）與開啟
+`opendesign.extraEnvSecret`。詳見
+[docs/MIGRATION.md](docs/MIGRATION.md#adopt-a-newer-chart-revision-without-restarting-anything)。
+
 ## 解除安裝
 
 ```bash
 helm -n pi-agent-woow uninstall od
 ```
 
-namespace 會保留（由 Rancher 管理且共用）。兩個 PVC 也會保留，因為帶
-`helm.sh/resource-policy: keep`。真的要刪資料：
+namespace 會保留（由 Rancher 管理且共用：本 chart 從不渲染 Namespace，所以也永遠
+刪不掉別人的 namespace）。兩個 PVC 也會保留，因為 `keepOnUninstall: true` 幫它們
+——以及由 chart 建立的 extra-env Secret——加上了 `helm.sh/resource-policy: keep`。
+真的要刪資料：
 
 ```bash
 kubectl -n pi-agent-woow delete pvc od-data od-backup   # 幾乎不可逆
@@ -234,6 +296,14 @@ kubectl -n pi-agent-woow delete pvc od-data od-backup   # 幾乎不可逆
 - NetworkPolicy 在 7457 埠只放行兩種來源：標籤為 `app=npm` 的 Pod，以及
   `192.168.0.0/16`（區網管理／除錯）——與五套 `pi-agent` 完全相同的形狀。其餘一律拒絕。
 - daemon 綁在 loopback，所以就算 NetworkPolicy 寫錯，7456 埠也不會外露。
+- chart 不建立 ServiceAccount，並設 `automountServiceAccountToken: false`。除非你
+  明確設定 `opendesign.extraEnvSecret.create: true`，它也不建立任何 Secret；預設是
+  引用「已經存在」的 Secret，金鑰完全不經過 Helm。
+- `opendesign.extraEnv` 會**以明文渲染進 `-config` ConfigMap**。用來放
+  `OD_ALLOWED_INTERNAL_HOSTS` 沒問題，放金鑰就是錯的：namespace 內任何能
+  `get configmaps` 的東西都讀得到，`helm get values` 也會回顯。伺服器端金鑰應該放
+  `opendesign.extraEnvSecret`，而 `rejectSecretShapedExtraEnv: true` 會把這句建議
+  變成渲染失敗。
 - `OD_API_TOKEN` 與 `OD_DISABLE_API_AUTH` 在本倉庫**任何地方都不存在**，且
   `tests/validate.py` 會在任一字串重新出現於 chart 檔案時讓建置失敗。1.x chart 設了
   `OD_BIND_HOST: "0.0.0.0"` 與 `OD_DISABLE_API_AUTH: "1"`，註解寫「Auth handled by
@@ -254,13 +324,19 @@ kubectl -n pi-agent-woow delete pvc od-data od-backup   # 幾乎不可逆
   `CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID`。
 
 輪替提醒：1.x `values.yaml` 提交過一把真實的 64 位十六進位 MCP JWT 金鑰、一組 MCP
-管理員密碼與一組 ttyd 密碼。它們在本倉庫的**公開** git 歷史中。詳見
-[docs/MIGRATION.md](docs/MIGRATION.md)。
+管理員密碼與一組 ttyd 密碼。它們在本倉庫的**公開** git 歷史中——那個 commit 仍可
+經由未刪除的分支與 GitHub 自己的 `refs/pull/N/head` 取得，刪分支並不會讓它消失，
+三者都必須當成已洩漏處理。詳見 [docs/MIGRATION.md](docs/MIGRATION.md)。
 
 ## 版本與發佈
 
-chart 版本與映像 tag 是**同一個數字**。`chart/Chart.yaml` 的 `version: 2.0.0` 是唯一
+chart 版本與映像 tag 是**同一個數字**。`chart/Chart.yaml` 的 `version: 2.0.1` 是唯一
 來源；`appVersion` 是 OpenDesign 版本（`0.21.1`）。Git tag 為 `v<chart 版本>`。
+
+`helm.sh/chart` 是 pod template 的標籤之一，所以「動 chart 版本 + upgrade 既有
+release」就會滾動一次 Pod。因此「不得重啟任何東西」的變更——例如讓正在跑的
+`opendesign` release 接上本 chart 的新版本——會刻意不動版本號，把 bump 留給那個
+被允許重啟的 release。
 
 `latest` 在 `Chart.yaml`、`values.yaml`、`Dockerfile`、workflow 與文件中一律禁止，
 由 `tests/validate.py` 強制。

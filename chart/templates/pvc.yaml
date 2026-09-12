@@ -5,15 +5,27 @@ two to drift.
 storageClassName is ALWAYS set explicitly -- this cluster has two
 StorageClasses annotated is-default-class=true (local-path and longhorn), so
 omitting it resolves by an ambiguous tiebreak.
+`helm.sh/resource-policy: keep` comes from the top-level keepOnUninstall, so
+one switch governs every stateful object instead of an annotation map that can
+be edited out per PVC by accident.
 */}}
+{{- $keep := dict -}}
+{{- range $k, $v := (.Values.persistence.data.annotations | default dict) }}
+{{- $_ := set $keep $k $v }}
+{{- end }}
+{{- if .Values.keepOnUninstall }}
+{{- $_ := set $keep "helm.sh/resource-policy" "keep" }}
+{{- end }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: {{ include "opendesign.fullname" . }}-data
   labels:
     {{- include "opendesign.labels" . | nindent 4 }}
+  {{- with $keep }}
   annotations:
-    {{- toYaml (required "persistence.data.annotations is required and must keep helm.sh/resource-policy: keep" .Values.persistence.data.annotations) | nindent 4 }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   accessModes:
     {{- toYaml .Values.persistence.data.accessModes | nindent 4 }}
@@ -22,6 +34,13 @@ spec:
     requests:
       storage: {{ required "persistence.data.size is required" .Values.persistence.data.size | quote }}
 {{- if .Values.backup.enabled }}
+{{- $backupKeep := dict -}}
+{{- range $k, $v := (.Values.backup.persistence.annotations | default dict) }}
+{{- $_ := set $backupKeep $k $v }}
+{{- end }}
+{{- if .Values.keepOnUninstall }}
+{{- $_ := set $backupKeep "helm.sh/resource-policy" "keep" }}
+{{- end }}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -30,8 +49,10 @@ metadata:
   labels:
     {{- include "opendesign.labels" . | nindent 4 }}
     app.kubernetes.io/component: backup
+  {{- with $backupKeep }}
   annotations:
-    {{- toYaml (required "backup.persistence.annotations is required and must keep helm.sh/resource-policy: keep" .Values.backup.persistence.annotations) | nindent 4 }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   accessModes:
     {{- toYaml .Values.backup.persistence.accessModes | nindent 4 }}

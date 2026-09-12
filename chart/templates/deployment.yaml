@@ -20,6 +20,12 @@ spec:
         # pi-agent Deployments do (they carry checksum/nginx).
         checksum/nginx: {{ include (print $.Template.BasePath "/configmap-nginx.yaml") . | sha256sum }}
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if and .Values.opendesign.extraEnvSecret.enabled .Values.opendesign.extraEnvSecret.create }}
+        # Only rendered when this chart owns the Secret; a Secret managed out of
+        # band is rotated by whoever owns it, and a checksum the chart cannot
+        # see would be a lie.
+        checksum/extra-env: {{ include (print $.Template.BasePath "/extra-env-secret.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -61,6 +67,14 @@ spec:
           envFrom:
             - configMapRef:
                 name: {{ include "opendesign.fullname" . }}-config
+            {{- if .Values.opendesign.extraEnvSecret.enabled }}
+            # Opt-in, off by default. Later in the list than the ConfigMap, so
+            # a key present in both would resolve to the Secret -- which the
+            # render-time guard in _helpers.tpl refuses to let happen.
+            - secretRef:
+                name: {{ include "opendesign.extraEnvSecretName" . }}
+                optional: {{ .Values.opendesign.extraEnvSecret.optional }}
+            {{- end }}
           securityContext:
             # PID 1 must chown the root-owned Longhorn mount before dropping
             # to uid 1001 via su-exec; that is the whole reason for uid 0.

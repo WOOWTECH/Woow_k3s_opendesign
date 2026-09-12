@@ -3,6 +3,85 @@
 Versions here are chart versions. The chart version and the published image tag
 are the same number; `appVersion` is the OpenDesign version.
 
+## Unreleased
+
+Chart-only. **The chart version is deliberately NOT bumped**: `helm.sh/chart` is
+one of the pod template labels, so bumping it and upgrading the live
+`opendesign` release would roll the pod. Rendering this revision with
+`deploy/woow-k3s/opendesign.yaml` produces objects identical to the live ones,
+field for field, which is the whole point. The version bump and the `v*` tag
+belong to the release that is allowed to restart something.
+
+- **The shipped default values render.** `helm template ./chart` with no `-f` at
+  all used to fail with `publicUrl is required`, which meant the chart's own
+  defaults could not be linted by chart-testing, could not be validated by
+  kubeconform on the default path, and told every reader to guess. `publicUrl`
+  now ships as `https://opendesign.example.com`: an example origin that renders
+  and validates, and that no browser can ever present — so leaving it in place
+  fails CLOSED (OpenDesign rejects every cross-site request) instead of the
+  fail-OPEN an empty `OD_ALLOWED_ORIGINS` would have been. `NOTES.txt` prints a
+  loud warning while it is still in effect, and an empty or non-`https://` value
+  is still a hard render failure.
+- **Credentials can be kept out of the ConfigMap.** `opendesign.extraEnv` is
+  rendered into `<release>-config` in cleartext, and the live release passes a
+  server-side OpenRouter key that way. New, all opt-in and all off by default,
+  so the live render does not move:
+  - `opendesign.extraEnvSecret.enabled` adds `envFrom.secretRef` to the
+    OpenDesign container;
+  - `opendesign.extraEnvSecret.create` (default `false`) renders that Secret
+    from values with `required()` on every entry, otherwise the chart only
+    references a Secret that already exists;
+  - `opendesign.rejectSecretShapedExtraEnv` turns a credential-shaped key in
+    `extraEnv` into a render failure;
+  - `examples/secrets.example.yaml` documents both modes with example values,
+    and `docs/MIGRATION.md` has the one-time migration for the live key.
+
+  Every way of getting that wrong is a render failure rather than a surprise at
+  runtime: `create: true` with no data or an empty value, `data` filled in while
+  `create` is false (nothing would render it), a Secret the Deployment would
+  never read, and the same key in both `extraEnv` and the Secret.
+- **`keepOnUninstall` (default `true`)** now owns `helm.sh/resource-policy:
+  keep` for both PVCs and for a chart-created Secret, instead of an annotation
+  map per PVC that could be edited out one at a time. The chart still renders no
+  Namespace. `tests/chart.test.sh` asserts both states of the switch.
+- **A read-only `helm test` hook.** One short-lived pod GETs `/api/health` and
+  `/api/version` through the Service — the same path NPM takes — mounting
+  nothing and reusing the already-pinned image. It deliberately does not carry
+  the chart's selector labels: a pod that did would join the Service
+  EndpointSlice and black-hole a share of live requests while it ran.
+  `networkPolicy.allowHelmTest` (default `false`) adds the single ingress peer
+  the hook needs when the policy is on.
+- **Instance values for the live release are committed** at
+  `deploy/woow-k3s/opendesign.yaml`, without secrets, next to
+  `deploy/woow-k3s/verify-live-render.sh` — a read-only script that diffs
+  `helm template` against `helm get manifest` and then against the live API
+  objects field by field, so "this upgrade rolls nothing" is a command rather
+  than a claim.
+- **`.gitignore` patterns are anchored.** An unanchored `secrets.yaml` matches at
+  any depth: the day someone added `chart/templates/secrets.yaml`, git would
+  have ignored it, `git add -A` would have skipped it, and every clone would
+  have rendered a different chart. `tests/chart.test.sh` now fails if any file
+  under `chart/` is ignored or untracked, and `tests/validate.py` fails if a
+  pattern loses its leading `/`.
+- **A mistyped values key is now a render failure.** `values.schema.json` sets
+  `additionalProperties: false` at the top level (it already did inside
+  `service`), so `imagePullSecret` for `imagePullSecrets` is rejected instead of
+  silently ignored — the failure mode where a chart runs with a setting its
+  author believes is in effect. `tests/validate.py` also asserts that every key
+  `values.yaml` ships is declared in the schema.
+- Two stale comments in `values.yaml`: the release job prints the published
+  digest in its step summary and does **not** write it back, and the live
+  release does set `imagePullSecrets` even though the package is public.
+- CI/tests: `helm lint` + `helm template` + `kubeconform -strict` over every
+  values combination the repo ships (defaults, minimal, full, every opt-in on,
+  `keepOnUninstall: false`, and the live instance values), one negative fixture
+  per render-time guard asserted by message, a `helm package` completeness check
+  so `.helmignore` cannot silently drop a template, and `bash -n` + shellcheck
+  over the new script.
+- Docs: `docs/MIGRATION.md` and `docs/CI.md` now exist — the READMEs and this
+  changelog had been linking to both since 2.0.0. The OCI install examples said
+  `--version 2.0.0`, which was never published; they say `2.0.1`, which is.
+
 ## 2.0.1
 
 Patch release. Chart and image contents are otherwise identical to 2.0.0.

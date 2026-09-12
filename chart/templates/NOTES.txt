@@ -2,6 +2,18 @@
 {{- $public := include "opendesign.publicUrl" . -}}
 Woow OpenDesign {{ .Chart.AppVersion }} (chart {{ .Chart.Version }}) installed as
 release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+{{ if eq $public "https://opendesign.example.com" }}
+=======================================================================
+WARNING: publicUrl is still the chart's example origin
+         ({{ $public }}).
+         That is not your hostname. OD_ALLOWED_ORIGINS and
+         OD_PUBLIC_BASE_URL now name a domain no browser will ever
+         present, so OpenDesign will reject every cross-site request
+         from your real hostname and the UI will not work.
+         Set publicUrl to the https:// origin NPM publishes and
+         `helm upgrade`.
+=======================================================================
+{{ end -}}
 
 Nothing is publicly reachable yet. The chart deliberately owns no ingress: the
 only path in is the shared Nginx Proxy Manager container, which is also the
@@ -36,6 +48,27 @@ Check it came up:
   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ $fullname }}
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fullname }} 7457:{{ .Values.service.port }}
   curl -s localhost:7457/api/health     # expect {"ok":true}
+{{ if .Values.helmTest.enabled }}
+  helm -n {{ .Release.Namespace }} test {{ .Release.Name }}
+{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.allowHelmTest) }}
+  # ^ will TIME OUT as configured: the NetworkPolicy admits only
+  #   {{ keys .Values.networkPolicy.fromPodLabels | join "," }}-labelled pods and the listed CIDRs.
+  #   Re-run after `helm upgrade --set networkPolicy.allowHelmTest=true`,
+  #   which rewrites that one policy and rolls nothing.
+{{- end }}
+  # Read-only: two GETs through the Service, no PVC mounted, nothing written.
+{{- end }}
+
+Uninstall keeps your data:
+{{ if .Values.keepOnUninstall }}
+  `helm uninstall {{ .Release.Name }}` leaves PVC {{ $fullname }}-data
+  {{- if .Values.backup.enabled }}, PVC {{ $fullname }}-backup{{ end }} and the
+  namespace in place (helm.sh/resource-policy: keep). Deleting the data is a
+  separate, deliberate `kubectl delete pvc`.
+{{- else }}
+  WARNING: keepOnUninstall is FALSE. `helm uninstall {{ .Release.Name }}` will
+  DELETE PVC {{ $fullname }}-data and every design in it.
+{{- end }}
 
 Security posture, so nobody "fixes" it later:
   * The daemon binds 127.0.0.1:{{ .Values.opendesign.port }} and is unreachable over the pod
@@ -52,8 +85,20 @@ Security posture, so nobody "fixes" it later:
     Origin header reach the daemon and are accepted via its loopback-Host
     branch. You are relying on the NPM Access List alone.
 {{- end }}
-  * This chart holds no credential. BYOK keys are entered in the browser and
-    stay browser-local.
+  * BYOK keys are entered in the browser and stay browser-local: they never
+    reach a ConfigMap, a Secret, an env var or the data volume.
+{{- if .Values.opendesign.extraEnvSecret.enabled }}
+  * Extra environment comes from Secret {{ include "opendesign.extraEnvSecretName" . }},
+    {{ if .Values.opendesign.extraEnvSecret.create }}rendered by this chart{{ else }}created out of band -- this chart only references it{{ end }}.
+    Those values are NOT in ConfigMap {{ $fullname }}-config.
+{{- end }}
+{{- if .Values.opendesign.extraEnv }}
+  * WARNING: opendesign.extraEnv is set, and it is rendered into ConfigMap
+    {{ $fullname }}-config in CLEARTEXT. Keys: {{ keys .Values.opendesign.extraEnv | sortAlpha | join ", " }}.
+    Anything with `get configmaps` in this namespace can read those values, and
+    `helm get values` echoes them back. If any of them is a credential, move it
+    to opendesign.extraEnvSecret.
+{{- end }}
 
 {{ if .Values.backup.enabled -}}
 Backup: CronJob {{ $fullname }}-backup runs "{{ .Values.backup.schedule }}", keeping {{ .Values.backup.retain }}

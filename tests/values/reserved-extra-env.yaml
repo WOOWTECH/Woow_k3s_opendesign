@@ -1,0 +1,5 @@
+# Negative fixture: a chart-owned env key supplied from outside. MUST fail.
+publicUrl: https://od-woow-k3s.woowtech.io
+opendesign:
+  extraEnv:
+    OD_BIND_HOST: "0.0.0.0"
