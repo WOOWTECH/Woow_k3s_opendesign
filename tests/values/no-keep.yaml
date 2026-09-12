@@ -1,0 +1,5 @@
+# keepOnUninstall: false -- the throwaway-test posture. Renders PVCs WITHOUT
+# helm.sh/resource-policy: keep, which tests/chart.test.sh asserts explicitly so
+# the retention switch cannot become a no-op.
+publicUrl: https://od-woow-k3s.woowtech.io
+keepOnUninstall: false

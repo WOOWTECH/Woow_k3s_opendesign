@@ -2,13 +2,18 @@
   "$schema": "https://json-schema.org/draft-07/schema#",
   "title": "Woow OpenDesign chart values",
   "type": "object",
-  "required": ["publicUrl", "image", "nginx", "opendesign", "service", "persistence", "backup", "networkPolicy", "probes"],
+  "required": ["publicUrl", "keepOnUninstall", "image", "nginx", "opendesign", "service", "persistence", "backup", "networkPolicy", "probes", "helmTest"],
   "properties": {
     "nameOverride": { "type": "string" },
     "fullnameOverride": { "type": "string" },
 
+    "keepOnUninstall": {
+      "description": "true annotates both PVCs and a chart-created extra-env Secret with helm.sh/resource-policy: keep, so `helm uninstall` never deletes data. The chart renders no Namespace.",
+      "type": "boolean"
+    },
+
     "publicUrl": {
-      "description": "https:// origin this instance is reached on through Nginx Proxy Manager. Empty passes the schema but the templates refuse to render, so the failure is a readable message rather than a malformed manifest.",
+      "description": "https:// origin this instance is reached on through Nginx Proxy Manager. The shipped default is an example domain so the chart's own defaults render; an EMPTY string passes the schema but the templates refuse to render, so that failure is a readable message rather than a malformed manifest.",
       "type": "string",
       "pattern": "^$|^https://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+(:[0-9]{1,5})?$"
     },
@@ -51,7 +56,28 @@
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "dataDir": { "type": "string", "pattern": "^/.+" },
         "timezone": { "type": "string", "minLength": 1 },
-        "extraEnv": { "type": "object", "additionalProperties": { "type": ["string", "number", "boolean"] } },
+        "extraEnv": {
+          "description": "Rendered into the -config ConfigMap in cleartext. Credentials belong in extraEnvSecret.",
+          "type": "object",
+          "additionalProperties": { "type": ["string", "number", "boolean"] }
+        },
+        "rejectSecretShapedExtraEnv": {
+          "description": "true turns a credential-shaped key in extraEnv into a render failure. Ships false because the live release still passes one such key that way.",
+          "type": "boolean"
+        },
+        "extraEnvSecret": {
+          "description": "Opt-in envFrom.secretRef for the OpenDesign container. Every default is off, so a release installed before this key existed renders identically.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "create"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "name": { "type": "string" },
+            "optional": { "type": "boolean" },
+            "create": { "type": "boolean" },
+            "data": { "type": "object", "additionalProperties": { "type": ["string", "number", "boolean"] } }
+          }
+        },
         "resources": { "type": "object" }
       }
     },
@@ -92,6 +118,10 @@
         "enabled": { "type": "boolean" },
         "fromPodLabels": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "string" } },
         "fromCIDRs": { "type": "array", "items": { "type": "string" } },
+        "allowHelmTest": {
+          "description": "true adds one ingress peer on the sidecar port for the helm test hook pod. Ships false so the rendered policy matches the live release byte for byte.",
+          "type": "boolean"
+        },
         "egressExcept": { "type": "array", "minItems": 1, "items": { "type": "string" } }
       }
     },
@@ -103,6 +133,16 @@
         "startup": { "$ref": "#/definitions/probe" },
         "readiness": { "$ref": "#/definitions/probe" },
         "liveness": { "$ref": "#/definitions/probe" }
+      }
+    },
+
+    "helmTest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "resources": { "type": "object" }
       }
     },
 
@@ -118,7 +158,7 @@
   "definitions": {
     "pvc": {
       "type": "object",
-      "required": ["storageClassName", "size", "accessModes", "annotations"],
+      "required": ["storageClassName", "size", "accessModes"],
       "properties": {
         "storageClassName": {
           "description": "Never omit: this cluster has two StorageClasses claiming is-default-class.",
@@ -128,8 +168,8 @@
         "size": { "type": "string", "pattern": "^[0-9]+(Mi|Gi|Ti)$" },
         "accessModes": { "type": "array", "minItems": 1, "items": { "enum": ["ReadWriteOnce", "ReadWriteMany", "ReadOnlyMany"] } },
         "annotations": {
+          "description": "Extra annotations. helm.sh/resource-policy: keep is added by the top-level keepOnUninstall, and a value of anything but `keep` here is rejected so the retention switch cannot be defeated per PVC.",
           "type": "object",
-          "required": ["helm.sh/resource-policy"],
           "properties": { "helm.sh/resource-policy": { "const": "keep" } }
         }
       }

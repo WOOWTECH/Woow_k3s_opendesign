@@ -5,8 +5,19 @@ storage, probes, the sidecar contract, and troubleshooting.
 
 ## Environment
 
-Everything OD reads comes from `ConfigMap <release>-config` via `envFrom`.
-**No Secret is involved and none is needed.**
+Everything OD reads comes from `ConfigMap <release>-config` via `envFrom`. The
+chart needs no Secret of its own: the daemon is loopback-bound so it needs no
+API token, and BYOK provider keys stay in the browser.
+
+**But a ConfigMap is cleartext.** `opendesign.extraEnv` is rendered straight
+into `<release>-config`, so anything with `get configmaps` in the namespace can
+read it and `helm get values` echoes it back. A server-side credential (an
+OpenRouter key used by the in-container OpenCode runtime, say) therefore belongs
+in `opendesign.extraEnvSecret`, which adds a second `envFrom` entry pointing at
+a Secret — by default one that already exists, so the value never passes through
+Helm at all. `opendesign.rejectSecretShapedExtraEnv: true` makes putting one in
+`extraEnv` a render failure. See `examples/secrets.example.yaml` and
+`docs/MIGRATION.md`.
 
 | Variable | Value | Source |
 |---|---|---|

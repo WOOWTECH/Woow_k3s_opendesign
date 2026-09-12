@@ -84,7 +84,30 @@ for label, text in [
     check("latest" not in layout.strip_comments(text).lower(), f"`latest` must not appear in {label}")
 
 # ---------------------------------------------------------------- values surface
-check(values.get("publicUrl") == "", "values.yaml publicUrl must ship empty so the install is forced to set it")
+# publicUrl ships as an EXAMPLE origin, not empty and never a real hostname.
+#   * empty would mean the chart's own defaults cannot be rendered, linted or
+#     kubeconformed, and would put OD_ALLOWED_ORIGINS="" into a ConfigMap if a
+#     guard ever regressed -- which is fail-OPEN
+#   * a real hostname shipped as a default is a footgun in the other direction:
+#     a second install elsewhere would silently trust this instance's origin
+# An example domain renders, validates, and fails CLOSED until it is overridden.
+public_url = values.get("publicUrl") or ""
+check(public_url.startswith("https://"), "values.yaml publicUrl must ship an https:// origin so the default values render")
+check(public_url.endswith(".example.com"), "values.yaml publicUrl must ship an example.com origin, never a routable hostname")
+check("woowtech" not in public_url, "values.yaml must not ship a real WOOWTECH hostname as the default publicUrl")
+check(values.get("keepOnUninstall") is True, "keepOnUninstall must default to true; `helm uninstall` must never delete tenant data")
+extra_env_secret = (values.get("opendesign") or {}).get("extraEnvSecret") or {}
+check(extra_env_secret.get("enabled") is False, "opendesign.extraEnvSecret.enabled must default false: the live pod template must not change")
+check(extra_env_secret.get("create") is False, "opendesign.extraEnvSecret.create must default false: the chart references existing Secrets")
+check((extra_env_secret.get("data") or {}) == {}, "opendesign.extraEnvSecret.data must ship empty")
+check((values.get("opendesign") or {}).get("extraEnv") == {}, "opendesign.extraEnv must ship empty")
+check((values.get("opendesign") or {}).get("rejectSecretShapedExtraEnv") is False,
+      "opendesign.rejectSecretShapedExtraEnv must ship false while the live release still passes a key through extraEnv")
+check((values.get("networkPolicy") or {}).get("allowHelmTest") is False,
+      "networkPolicy.allowHelmTest must ship false so the rendered policy matches the live release")
+check((values.get("helmTest") or {}).get("enabled") is True, "the helm test hook must ship enabled")
+check((CHART / "templates/test-connection.yaml").is_file(), "the chart must ship a `helm test` hook")
+check((CHART / "templates/extra-env-secret.yaml").is_file(), "the chart must ship the opt-in extra-env Secret template")
 image_values = values.get("image") or {}
 check(image_values.get("repository") == GHCR_IMAGE, f"image.repository must be {GHCR_IMAGE}")
 check(image_values.get("digest", "") == "", "values.yaml must ship an empty image.digest")
@@ -338,8 +361,63 @@ check(UPSTREAM_IMAGE in workflow_text, "workflow build inputs must pin the appro
 for action_ref in re.findall(r"uses:\s*[^\s]+@([^\s#]+)", workflow_text):
     check(bool(re.fullmatch(r"[0-9a-f]{40}", action_ref)), f"GitHub Action is not pinned to a full commit SHA: {action_ref}")
 
-for required in ["README.md", "README_zh-TW.md", "DOCS.md", "CHANGELOG.md", "LICENSE"]:
+for required in [
+    "README.md", "README_zh-TW.md", "DOCS.md", "CHANGELOG.md", "LICENSE",
+    "docs/MIGRATION.md", "docs/CI.md",
+    "examples/secrets.example.yaml",
+    "deploy/woow-k3s/opendesign.yaml",
+    "deploy/woow-k3s/verify-live-render.sh",
+]:
     check((ROOT / required).is_file(), f"missing required file: {required}")
+
+# ------------------------------------------------- committed values hygiene
+# deploy/ holds the values of things that are actually running, and examples/
+# documents the Secret surface. Neither may ever carry a real credential, and
+# the instance values must additionally be renderable on their own.
+instance_values_text = (ROOT / "deploy/woow-k3s/opendesign.yaml").read_text(encoding="utf-8")
+instance_values = yaml.safe_load(instance_values_text) or {}
+check("extraEnv" not in yaml.safe_dump(instance_values.get("opendesign") or {}),
+      "deploy/woow-k3s/opendesign.yaml must not carry opendesign.extraEnv: that map is rendered into a cleartext ConfigMap")
+check(str(instance_values.get("publicUrl", "")).startswith("https://"),
+      "the live instance values must record the real https:// publicUrl")
+for label, path in [
+    ("deploy/woow-k3s/opendesign.yaml", ROOT / "deploy/woow-k3s/opendesign.yaml"),
+    ("examples/secrets.example.yaml", ROOT / "examples/secrets.example.yaml"),
+]:
+    body = layout.strip_comments(path.read_text(encoding="utf-8"))
+    # An image digest is the one legitimate 64-hex string in these files.
+    check(not hex64.search(re.sub(r"sha256:[0-9a-f]{64}", "sha256:<digest>", body)),
+          f"64-hex secret-shaped literal committed in {label}")
+    for line in body.splitlines():
+        match = assignment.match(line)
+        if not match:
+            continue
+        key, value = match.group(1), match.group(2)
+        if not secret_key.search(key) or key.lower() in ALLOWED_SECRET_KEYS:
+            continue
+        if value in empty_values:
+            continue
+        # An example value must SAY it is an example. Anything else is assumed
+        # to be real: that is the assumption the 1.x values.yaml needed.
+        check(bool(re.search(r"EXAMPLE|example", value)),
+              f"credential-shaped assignment in {label}: {key}: <redacted> -- example values must contain EXAMPLE")
+
+# .gitignore must not be able to swallow a chart template. An unanchored
+# `secrets.yaml` matches at every depth, so the day someone adds
+# chart/templates/secrets.yaml git ignores it and every clone renders a
+# different chart. tests/chart.test.sh proves the current tree is clean; this
+# check keeps the patterns themselves anchored.
+gitignore_lines = [
+    line.strip() for line in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.strip().startswith("#")
+]
+_UNANCHORED_OK = {"node_modules/", "npm-debug.log*", ".vscode/", ".idea/", "*.swp", ".DS_Store", "Thumbs.db"}
+for line in gitignore_lines:
+    pattern = line.lstrip("!")
+    if pattern in _UNANCHORED_OK:
+        continue
+    check(pattern.startswith("/"),
+          f".gitignore pattern {line!r} is not anchored with a leading `/`; it can match a chart template at any depth")
 
 if errors:
     for error in errors:

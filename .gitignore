@@ -7,62 +7,73 @@
 # chart/values.yaml. This file is the second line: it keeps the local files
 # that DO hold credentials -- values overrides, kubeconfigs, env files --
 # from ever being staged. See docs/MIGRATION.md.
+#
+# EVERY PATTERN HERE IS ANCHORED WITH A LEADING `/`.
+# That is not cosmetic. An unanchored `secrets.yaml` matches a file of that name
+# at ANY depth, so the day someone adds `chart/templates/secrets.yaml` git
+# ignores it, `git add -A` silently skips it, the chart still renders on the
+# author's machine, and the pushed chart is missing a template. Anchored
+# patterns match only the repository root, which is where a local override is
+# actually written, and cannot reach into chart/templates/ at all.
+# tests/chart.test.sh enforces this: it fails if any file under chart/ is
+# ignored or untracked.
 
 # --- Local Helm values overrides (these hold real hostnames and, historically,
-# --- real secrets). chart/values.yaml and tests/values/ stay tracked.
-values.local.yaml
-values-local.yaml
-*.local.yaml
-*.local.yml
-my-values.yaml
-values.override.yaml
-values-override.yaml
-override-values.yaml
-secrets.yaml
-secret-values.yaml
-*.secrets.yaml
-!chart/values.yaml
-!tests/values/*.yaml
+# --- real secrets). chart/values.yaml, chart/ci/, tests/values/ and
+# --- deploy/woow-k3s/ are tracked and must stay tracked.
+/values.local.yaml
+/values-local.yaml
+/*.local.yaml
+/*.local.yml
+/my-values.yaml
+/values.override.yaml
+/values-override.yaml
+/override-values.yaml
+/secrets.yaml
+/secret-values.yaml
+/*.secrets.yaml
+/*-secret-values.yaml
+/od-values.yaml
 
 # --- Cluster credentials
-kubeconfig
-kubeconfig-*
-*.kubeconfig
-.kube/
-*.kubeconfig.yaml
-admin.conf
+/kubeconfig
+/kubeconfig-*
+/*.kubeconfig
+/.kube/
+/*.kubeconfig.yaml
+/admin.conf
 
 # --- Generic credential material
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-*.p12
-*.pfx
-htpasswd
-.htpasswd
+/.env
+/.env.*
+!/.env.example
+/*.pem
+/*.key
+/*.p12
+/*.pfx
+/htpasswd
+/.htpasswd
 
 # --- Helm build output
-*.tgz
-chart/charts/
-chart/Chart.lock
-chart/requirements.lock
-helm-render.yaml
-rendered.yaml
+/*.tgz
+/chart/charts/
+/chart/Chart.lock
+/chart/requirements.lock
+/helm-render.yaml
+/rendered.yaml
 
 # --- Container / build artifacts
-*.tar
-*.tar.gz
+/*.tar
+/*.tar.gz
 
 # --- Node
 node_modules/
 npm-debug.log*
 
 # --- Test scratch
-tests/.tmp/
-tests/out/
-.playwright-mcp/
+/tests/.tmp/
+/tests/out/
+/.playwright-mcp/
 
 # --- Editors and OS
 .vscode/

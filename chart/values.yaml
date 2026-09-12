@@ -12,17 +12,39 @@
 nameOverride: ""
 fullnameOverride: ""
 
+# ── Data retention ─────────────────────────────────────────────────────────
+# true adds `helm.sh/resource-policy: keep` to every object that holds state:
+# both PVCs, and the extra-env Secret when this chart creates it.
+# `helm uninstall` then leaves the data behind -- the only reason the previous
+# deployment's ~204 MiB of tenant data survived at all. The chart renders no
+# Namespace (pi-agent-woow is Rancher-managed and shared), so there is nothing
+# namespace-shaped to keep.
+#
+# Set it false ONLY for a throwaway test release whose volumes should go with
+# it, and expect `helm uninstall` to take the data with them.
+keepOnUninstall: true
+
 # ── Required ───────────────────────────────────────────────────────────────
 # The public origin this instance is reached on THROUGH Nginx Proxy Manager,
 # e.g. https://od-woow-k3s.woowtech.io
 #
-# Drives OD_ALLOWED_ORIGINS and OD_PUBLIC_BASE_URL. There is deliberately no
-# default: a wrong origin silently disables OpenDesign's cross-site rejection,
-# so the chart REFUSES TO RENDER while this is empty and tells you so. That is
-# a loud, install-time failure by design -- unlike the old chart's
-# `__K3S_NODE_HOSTNAME__`, which rendered happily and was only rejected later
-# by the API server.
-publicUrl: ""
+# Drives OD_ALLOWED_ORIGINS and OD_PUBLIC_BASE_URL. EVERY install must set it.
+#
+# The value below is an example domain, never a real one, and it is chosen so
+# that the shipped defaults render and validate: `helm template ./chart`,
+# `helm lint`, kubeconform and chart-testing all exercise the default path.
+# Leaving it in place fails CLOSED rather than open -- OD_ALLOWED_ORIGINS is
+# then an origin no browser can ever present, so OpenDesign rejects every
+# cross-site request instead of trusting them all, which is what an EMPTY
+# value used to do.
+#
+# The guards are still hard render failures:
+#   * an empty string                              -> "publicUrl is required"
+#   * anything but an https:// origin with no path -> "publicUrl must be ..."
+# and NOTES.txt prints a loud warning while this example value is still in
+# effect. Unlike the old chart's `__K3S_NODE_HOSTNAME__`, nothing unusable can
+# reach the API server.
+publicUrl: "https://opendesign.example.com"
 
 # ── OpenDesign image ───────────────────────────────────────────────────────
 image:
@@ -72,9 +94,52 @@ opendesign:
   # Extra env for the OpenDesign container, for reviewed additions such as
   # OD_ALLOWED_INTERNAL_HOSTS. OD_BIND_HOST, OD_PORT, OD_DATA_DIR,
   # OD_ALLOWED_ORIGINS and OD_PUBLIC_BASE_URL are chart-owned and are rejected
-  # here; so are OD_API_TOKEN and OD_DISABLE_API_AUTH, which this deployment
-  # does not need and must never set.
+  # here; so are the API-token and disabled-auth switches, which this
+  # deployment does not need and must never set.
+  #
+  # THIS MAP IS RENDERED INTO THE -config ConfigMap IN CLEARTEXT. Anything with
+  # get on ConfigMaps in the namespace can read it, and `helm get values` echoes
+  # it back. Nothing that behaves like a credential belongs here -- that is what
+  # extraEnvSecret below is for.
   extraEnv: {}
+
+  # Render-time guard: fail when a key in extraEnv looks like a credential
+  # (anything ending in _API_KEY, _TOKEN, _SECRET, _PASSWORD).
+  #
+  # Ships false, deliberately. The live `opendesign` release passes an
+  # OpenRouter key through extraEnv today, and flipping this on by default
+  # would make its own values un-renderable. Flip it to true in the instance
+  # values once that key has moved to extraEnvSecret.
+  rejectSecretShapedExtraEnv: false
+
+  # Extra env taken from a Secret instead of the ConfigMap. envFrom keeps the
+  # values out of the ConfigMap, out of the pod spec and out of
+  # `helm get values`; only the Secret NAME is ever rendered.
+  #
+  # Every default here is off, so the rendered Deployment is byte-identical to
+  # a release installed before this key existed.
+  extraEnvSecret:
+    # true appends envFrom.secretRef to the OpenDesign container. That CHANGES
+    # THE POD TEMPLATE, so turning it on rolls the pod once.
+    enabled: false
+    # Name of the Secret. Empty means <fullname>-extra-env.
+    name: ""
+    # true tolerates the Secret being absent at pod start (the kubelet skips
+    # it). Keep false: a silently missing variable is worse than a pod that
+    # refuses to start.
+    optional: false
+    # false (the default) means the Secret already exists and is managed OUT OF
+    # BAND -- `kubectl create secret generic`, or whatever the namespace
+    # already uses. The chart only references it by name.
+    #
+    # true renders the Secret from `data` below, with required() on every
+    # value, so an empty one is a render failure rather than an empty variable.
+    # Use it only where the values file itself is never committed: values
+    # passed to `helm install` also land in the release Secret, base64-encoded
+    # but not encrypted. See examples/secrets.example.yaml.
+    create: false
+    # KEY: value pairs, read only when create: true.
+    data: {}
 
   # Sized for one headless Chromium render at a time (the renderer holds a
   # Semaphore(1)) with MAX_PIXELS 48,000,000 -- a 48 MP RGBA bitmap alone is
@@ -111,8 +176,9 @@ persistence:
     size: 20Gi
     accessModes:
       - ReadWriteOnce
-    annotations:
-      helm.sh/resource-policy: keep
+    # Extra annotations only. `helm.sh/resource-policy: keep` comes from the
+    # top-level keepOnUninstall and must not be repeated here.
+    annotations: {}
 
 # ── Backup ─────────────────────────────────────────────────────────────────
 # Longhorn has no working backup target on this cluster
@@ -132,8 +198,7 @@ backup:
     size: 20Gi
     accessModes:
       - ReadWriteOnce
-    annotations:
-      helm.sh/resource-policy: keep
+    annotations: {}
   resources:
     requests:
       cpu: 50m
@@ -156,6 +221,13 @@ networkPolicy:
   # Extra CIDRs allowed in (LAN admin/debug), matching the pi-agent fleet.
   fromCIDRs:
     - 192.168.0.0/16
+  # Add one more ingress peer -- sidecar port only -- selecting the `helm test`
+  # hook pod (component=helm-test, this release). Without it the hook cannot
+  # reach the Service while this policy is in force and `helm test` times out.
+  #
+  # Ships false so the rendered NetworkPolicy stays byte-identical to the live
+  # release's. Turning it on rewrites ONE NetworkPolicy and rolls nothing.
+  allowHelmTest: false
   # Egress: DNS to kube-dns, then everything EXCEPT the pod CIDR, the service
   # CIDR, the LAN and the metadata IP.
   egressExcept:
@@ -184,6 +256,27 @@ probes:
     periodSeconds: 30
     failureThreshold: 5
     timeoutSeconds: 10
+
+# ── helm test ──────────────────────────────────────────────────────────────
+# A read-only smoke hook: one short-lived pod that GETs /api/health and
+# /api/version through the Service, over exactly the path Nginx Proxy Manager
+# uses. It writes nothing, mounts no PVC, and reuses the already-pinned
+# OpenDesign image, so no extra image has to be pulled or trusted.
+#
+# It deliberately does NOT carry the chart's selector labels: a pod that did
+# would join the Service EndpointSlice and black-hole a share of live requests
+# for as long as it ran.
+#
+# With networkPolicy.enabled: true it also needs networkPolicy.allowHelmTest.
+helmTest:
+  enabled: true
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 256Mi
 
 # ── Scheduling / misc ──────────────────────────────────────────────────────
 podAnnotations: {}

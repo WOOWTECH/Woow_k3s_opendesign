@@ -1,0 +1,87 @@
+# Instance values for the LIVE release: `opendesign` in namespace
+# `pi-agent-woow` on cluster `woow-k3s`.
+#
+# Recorded from `helm get values opendesign` at revision 7 (chart
+# opendesign-2.0.1, deployed 2026-09-10 22:03 +0800). Rendering this chart with
+# this file reproduces the live objects field for field:
+#
+#   ./deploy/woow-k3s/verify-live-render.sh
+#
+# NO SECRET IS IN THIS FILE, and none may be added to it. See the
+# OPENROUTER_API_KEY note at the bottom -- the live release carries one value
+# that is deliberately NOT recorded here, which means this file ON ITS OWN is
+# not yet a complete `helm upgrade` input.
+
+# The public origin Nginx Proxy Manager / the pi-tunnel route publishes.
+publicUrl: https://od-woow-k3s.woowtech.io
+
+image:
+  # The exact image the live pod runs. The digest wins over image.tag, so the
+  # chart version and the running image are decoupled and an upgrade of this
+  # chart cannot silently move the image.
+  digest: sha256:f577947fe89d4a941995a54d4d3541dc1343b2a97d56169e8add5391bf93f8f7
+
+# Present on the live release. The GHCR package is public and can be pulled
+# anonymously, so this is belt-and-braces rather than a requirement; it is kept
+# because removing it would rewrite the live pod template for no gain.
+imagePullSecrets:
+  - name: ghcr-woowtech
+
+networkPolicy:
+  # NOT the chart default (app: npm). On this cluster the pi-tunnel cloudflared
+  # pods are what reach this Service, so they are the peer that has to be
+  # allowed in.
+  #
+  # That also means the request path does not traverse Nginx Proxy Manager,
+  # which the chart's own README names as the authentication boundary. Putting
+  # that boundary back is a change to the pi-tunnel release and/or to Cloudflare
+  # Access, i.e. outside this chart, and is tracked as a follow-up on the
+  # migration PR rather than described further here.
+  fromPodLabels:
+    app: pi-tunnel-cloudflared
+
+  # Explicit, and equal to the chart default: the live NetworkPolicy has exactly
+  # two ingress peers. Setting this true adds a third (the helm test hook) and
+  # is the one-line change that makes `helm test` usable against this release.
+  allowHelmTest: false
+
+# Explicit, and equal to the chart defaults. Spelled out because they are the
+# two switches that decide whether tenant data survives a mistake.
+keepOnUninstall: true
+persistence:
+  data:
+    storageClassName: longhorn
+    size: 20Gi
+backup:
+  enabled: true
+
+opendesign:
+  # Equal to the chart default. It cannot be flipped to true while
+  # OPENROUTER_API_KEY is still passed through extraEnv (see below): the guard
+  # would refuse to render this very file.
+  rejectSecretShapedExtraEnv: false
+
+# ── NOT RECORDED HERE: OPENROUTER_API_KEY ──────────────────────────────────
+# The live release passes
+#
+#   opendesign.extraEnv.OPENROUTER_API_KEY: <secret>
+#
+# which the chart renders into ConfigMap opendesign-config in CLEARTEXT. The
+# value is a credential, so it is not committed. Two consequences:
+#
+#   1. `helm upgrade -f deploy/woow-k3s/opendesign.yaml` WITH NOTHING ELSE
+#      would DROP that key from the ConfigMap and roll the pod. Until the
+#      migration below is done, always pass the live value as well, read
+#      straight out of the cluster and never echoed:
+#
+#        helm -n pi-agent-woow upgrade opendesign ./chart \
+#          -f deploy/woow-k3s/opendesign.yaml \
+#          --set-string "opendesign.extraEnv.OPENROUTER_API_KEY=$(
+#            kubectl --context woow-k3s -n pi-agent-woow get cm opendesign-config \
+#              -o go-template='{{ index .data "OPENROUTER_API_KEY" }}')"
+#
+#   2. The migration itself (follow-up): create a Secret out of band, then set
+#      opendesign.extraEnvSecret.enabled: true here, drop the extraEnv key and
+#      flip rejectSecretShapedExtraEnv to true. That changes the pod template,
+#      so it rolls the pod once and is a deliberate maintenance action, not part
+#      of a chart-only change. examples/secrets.example.yaml has the shape.

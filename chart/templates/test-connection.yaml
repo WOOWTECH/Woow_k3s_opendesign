@@ -1,0 +1,67 @@
+{{- if .Values.helmTest.enabled }}
+{{/*
+`helm test` hook: read-only.
+
+It GETs /api/health and /api/version through the Service, which is the exact
+path Nginx Proxy Manager takes, so a pass proves Service -> sidecar :{{ .Values.nginx.port }} ->
+127.0.0.1:{{ .Values.opendesign.port }} -> daemon end to end. It mounts no PVC, writes nothing, and
+sends no method other than GET.
+
+The image is the chart's own, already pinned by digest and already present on
+the node, so the hook adds no third-party image to trust.
+
+LABELS: this pod must NOT carry opendesign.selectorLabels. The Service and the
+Deployment both select on them, and this pod listens on nothing, so a full
+label set would put it in the Service EndpointSlice and black-hole a share of
+live traffic for as long as the hook ran.
+*/}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "opendesign.fullname" . }}-test-connection
+  labels:
+    {{- include "opendesign.nonSelectorLabels" . | nindent 4 }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: helm-test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: probe
+      image: {{ include "opendesign.image" . | quote }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command:
+        - /bin/sh
+        - -ceu
+        - |
+          endpoint="http://{{ include "opendesign.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}"
+          echo "[test] GET ${endpoint}/api/health"
+          health="$(wget -q -O- --timeout=10 "${endpoint}/api/health")"
+          echo "[test] ${health}"
+          case "${health}" in
+            *'"ok":true'*) ;;
+            *) echo "[test] /api/health did not report ok:true" >&2; exit 1 ;;
+          esac
+          echo "[test] GET ${endpoint}/api/version"
+          version="$(wget -q -O- --timeout=10 "${endpoint}/api/version")"
+          echo "[test] ${version}"
+          test -n "${version}"
+          echo "[test] the Service reaches the loopback daemon through the sidecar"
+      securityContext:
+        runAsUser: 1001
+        runAsGroup: 1001
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        {{- toYaml .Values.helmTest.resources | nindent 8 }}
+{{- end }}

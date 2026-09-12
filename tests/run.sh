@@ -57,6 +57,10 @@ echo "node --check: ${#javascript[@]} file(s) OK"
 
 shell_scripts=("$LAUNCHER" tests/run.sh tests/chart.test.sh tests/container-smoke.sh tests/lib/layout.sh)
 [[ -f .github/scripts/release-preflight.sh ]] && shell_scripts+=(.github/scripts/release-preflight.sh)
+[[ -f .github/scripts/chart-version.sh ]] && shell_scripts+=(.github/scripts/chart-version.sh)
+# The takeover proof script. It only reads, but it reads a credential out of a
+# ConfigMap, so it gets the same syntax and shellcheck treatment as the rest.
+[[ -f deploy/woow-k3s/verify-live-render.sh ]] && shell_scripts+=(deploy/woow-k3s/verify-live-render.sh)
 bash -n "${shell_scripts[@]}"
 echo "bash -n: ${#shell_scripts[@]} script(s) OK"
 

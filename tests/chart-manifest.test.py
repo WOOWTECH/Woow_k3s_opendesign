@@ -64,9 +64,15 @@ def one(kind: str, source=None) -> dict:
 
 # ------------------------------------------------------------- object inventory
 kinds = sorted(doc.get("kind", "?") for doc in docs)
+# The Pod is the `helm test` hook. `helm template` prints hooks, `helm get
+# manifest` does not and `helm upgrade` never applies them, so it is part of the
+# render but not of the installed object set.
 expected_kinds = sorted(["ConfigMap", "ConfigMap", "PersistentVolumeClaim", "PersistentVolumeClaim",
-                         "Deployment", "Service", "NetworkPolicy", "CronJob"])
+                         "Deployment", "Service", "NetworkPolicy", "CronJob", "Pod"])
 check(kinds == expected_kinds, f"rendered object set must be exactly {expected_kinds}, got {kinds}")
+# Secret is forbidden HERE, with the shipped full values: the extra-env Secret
+# is strictly opt-in. tests/chart.test.sh renders tests/values/extras.yaml and
+# asserts the opt-in path separately.
 for forbidden in ("Namespace", "Secret", "ServiceAccount", "Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding", "Ingress"):
     check(not by_kind(forbidden), f"the chart must not render a {forbidden}")
 
@@ -279,6 +285,45 @@ if backup_containers:
     backup_security = backup_container.get("securityContext") or {}
     check(backup_security.get("runAsUser") == 1001, "the backup Job must run as the OpenDesign UID")
     check((backup_security.get("capabilities") or {}).get("drop") == ["ALL"], "the backup Job must drop all capabilities")
+
+# ----------------------------------------------------------- helm test hook
+# A hook pod that carried the chart's selector labels would be added to the
+# Service's EndpointSlice the moment its container was Ready -- and it listens
+# on nothing, so a share of live requests would be answered with a connection
+# refused for as long as it ran. Asserting the label shape is the only way that
+# stays fixed.
+hook = one("Pod")
+hook_annotations = (hook.get("metadata") or {}).get("annotations") or {}
+check(hook_annotations.get("helm.sh/hook") == "test", "the Pod in the render must be the helm test hook")
+check(hook_annotations.get("helm.sh/hook-delete-policy") == "before-hook-creation",
+      "the test hook must be deleted before it is recreated, or a second `helm test` fails on a name clash")
+hook_labels = (hook.get("metadata") or {}).get("labels") or {}
+selector = (service.get("spec") or {}).get("selector") or {}
+check(selector and not all(hook_labels.get(key) == value for key, value in selector.items()),
+      f"the test hook pod matches the Service selector {selector} and would join its EndpointSlice")
+deployment_selector = ((deployment.get("spec") or {}).get("selector") or {}).get("matchLabels") or {}
+check(deployment_selector and not all(hook_labels.get(key) == value for key, value in deployment_selector.items()),
+      "the test hook pod matches the Deployment selector and would be adopted by its ReplicaSet")
+hook_spec = hook.get("spec") or {}
+check(hook_spec.get("restartPolicy") == "Never", "a test hook must not restart")
+check(hook_spec.get("automountServiceAccountToken") is False, "the test hook must not mount a ServiceAccount token")
+check(not hook_spec.get("volumes"), "the test hook is read-only: it must mount no volume, least of all the data PVC")
+hook_containers = hook_spec.get("containers") or []
+check(len(hook_containers) == 1, "the test hook must run one container")
+if hook_containers:
+    probe = hook_containers[0]
+    check(probe.get("image") == image, "the test hook must reuse the already-pinned OD image, not pull a new one")
+    check(not probe.get("volumeMounts"), "the test hook must mount nothing")
+    probe_security = probe.get("securityContext") or {}
+    check(probe_security.get("runAsUser") == 1001 and probe_security.get("runAsNonRoot") is True,
+          "the test hook must run unprivileged")
+    check(probe_security.get("readOnlyRootFilesystem") is True, "the test hook needs no writable filesystem")
+    check((probe_security.get("capabilities") or {}).get("drop") == ["ALL"], "the test hook must drop all capabilities")
+    command = " ".join(probe.get("command") or [])
+    check("/api/health" in command and "/api/version" in command,
+          "the test hook must probe /api/health and /api/version")
+    for write in ("--post-data", "--method=POST", "-O ", "DELETE", "PUT"):
+        check(write not in command, f"the test hook must stay read-only; found {write!r} in its command")
 
 # --------------------------------------------------------------- config env
 config_maps = {doc["metadata"]["name"]: doc for doc in by_kind("ConfigMap")}

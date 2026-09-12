@@ -1,0 +1,30 @@
+# chart-testing fixture, mirror of tests/values/extras.yaml.
+# Every opt-in this chart has, all on at once, so the render, the schema and
+# kubeconform all see the branches the default path never reaches:
+#   * the extra-env Secret, rendered by the chart (create: true)
+#   * the NetworkPolicy peer for the helm test hook
+#   * the helm test hook itself
+#
+# The value below is an obvious example string, not a credential.
+publicUrl: https://od-woow-k3s.woowtech.io
+
+keepOnUninstall: true
+
+opendesign:
+  # On: proves the guard passes when nothing credential-shaped is in extraEnv.
+  rejectSecretShapedExtraEnv: true
+  extraEnv:
+    OD_ALLOWED_INTERNAL_HOSTS: example.internal
+  extraEnvSecret:
+    enabled: true
+    create: true
+    optional: false
+    data:
+      OPENROUTER_API_KEY: sk-or-v1-EXAMPLE-NOT-A-REAL-KEY
+
+networkPolicy:
+  enabled: true
+  allowHelmTest: true
+
+backup:
+  enabled: true
