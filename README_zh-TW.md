@@ -253,6 +253,19 @@ Deployment 使用 `strategy: Recreate`，因為資料卷是 Longhorn RWO，無�
 請把發佈作業印出的 digest 填進 `image.digest`。改動 nginx ConfigMap 會透過
 `checksum/nginx` annotation 自動滾動 Pod。
 
+**要升級「已經在跑」的那個 release、而且不接受滾動**時：live 的 values（不含密文）
+已提交在 [`deploy/woow-k3s/opendesign.yaml`](deploy/woow-k3s/opendesign.yaml)，而
+
+```bash
+./deploy/woow-k3s/verify-live-render.sh        # 唯讀
+```
+
+會在你執行 `helm upgrade` 之前，先證明這個 chart 渲染出來的東西跟叢集上現有的一模
+一樣——先比 `helm get manifest`，再逐欄位比對 live 的 API 物件。有兩種改動一定會滾動
+Pod，而且是刻意的：動 chart 版本（`helm.sh/chart` 是 pod template 標籤）與開啟
+`opendesign.extraEnvSecret`。詳見
+[docs/MIGRATION.md](docs/MIGRATION.md#adopt-a-newer-chart-revision-without-restarting-anything)。
+
 ## 解除安裝
 
 ```bash

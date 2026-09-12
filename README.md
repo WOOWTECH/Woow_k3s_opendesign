@@ -279,6 +279,22 @@ short outage on every rollout; that is the correct mechanism, not node pinning.
 Pin `image.digest` to the digest the release job printed. Editing the nginx
 ConfigMap rolls the pod on its own via the `checksum/nginx` pod annotation.
 
+**Upgrading the release that is already running**, where a rollout is not
+acceptable: the live values are committed at
+[`deploy/woow-k3s/opendesign.yaml`](deploy/woow-k3s/opendesign.yaml) (without
+secrets), and
+
+```bash
+./deploy/woow-k3s/verify-live-render.sh        # read-only
+```
+
+proves the chart renders exactly what is already there — `helm get manifest`
+diff plus a field-by-field comparison against the live API objects — before you
+run `helm upgrade`. Two changes always roll the pod, deliberately: bumping the
+chart version (`helm.sh/chart` is a pod template label) and enabling
+`opendesign.extraEnvSecret`. See
+[docs/MIGRATION.md](docs/MIGRATION.md#adopt-a-newer-chart-revision-without-restarting-anything).
+
 ## Uninstall
 
 ```bash
