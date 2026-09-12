@@ -142,6 +142,7 @@
       "required": ["enabled"],
       "properties": {
         "enabled": { "type": "boolean" },
+        "retries": { "type": "integer", "minimum": 1 },
         "resources": { "type": "object" }
       }
     },

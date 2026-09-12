@@ -142,6 +142,17 @@ With `networkPolicy.enabled: true` the hook also needs
 `networkPolicy.allowHelmTest: true`, which adds exactly one ingress peer (the
 hook pod, this release) on port 7457 and changes no pod template.
 
+Each GET is retried (`helmTest.retries`, 15 attempts two seconds apart). That is
+not padding: the hook pod is created seconds before it runs and the
+NetworkPolicy admitting it is enforced from an ipset keyed on its IP, which the
+policy controller has to learn first — connect before it has, and the packet is
+rejected and looks exactly like a broken Service. Back-to-back `helm test` runs
+failed that way about half the time with a single attempt.
+
+The hook pod is left behind after the run (`helm.sh/hook-delete-policy:
+before-hook-creation`), so `kubectl -n pi-agent-woow logs od-test-connection`
+still shows what it saw; the next `helm test` replaces it.
+
 **Uninstalling does not delete your data.** With `keepOnUninstall: true` (the
 default) both PVCs — and the extra-env Secret, when the chart creates it — carry
 `helm.sh/resource-policy: keep`, and they sit on a `Retain` StorageClass.

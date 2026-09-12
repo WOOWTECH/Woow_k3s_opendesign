@@ -85,8 +85,20 @@ Security posture, so nobody "fixes" it later:
     Origin header reach the daemon and are accepted via its loopback-Host
     branch. You are relying on the NPM Access List alone.
 {{- end }}
-  * This chart holds no credential. BYOK keys are entered in the browser and
-    stay browser-local.
+  * BYOK keys are entered in the browser and stay browser-local: they never
+    reach a ConfigMap, a Secret, an env var or the data volume.
+{{- if .Values.opendesign.extraEnvSecret.enabled }}
+  * Extra environment comes from Secret {{ include "opendesign.extraEnvSecretName" . }},
+    {{ if .Values.opendesign.extraEnvSecret.create }}rendered by this chart{{ else }}created out of band -- this chart only references it{{ end }}.
+    Those values are NOT in ConfigMap {{ $fullname }}-config.
+{{- end }}
+{{- if .Values.opendesign.extraEnv }}
+  * WARNING: opendesign.extraEnv is set, and it is rendered into ConfigMap
+    {{ $fullname }}-config in CLEARTEXT. Keys: {{ keys .Values.opendesign.extraEnv | sortAlpha | join ", " }}.
+    Anything with `get configmaps` in this namespace can read those values, and
+    `helm get values` echoes them back. If any of them is a credential, move it
+    to opendesign.extraEnvSecret.
+{{- end }}
 
 {{ if .Values.backup.enabled -}}
 Backup: CronJob {{ $fullname }}-backup runs "{{ .Values.backup.schedule }}", keeping {{ .Values.backup.retain }}

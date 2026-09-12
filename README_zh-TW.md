@@ -132,6 +132,15 @@ Pod **刻意不帶** chart 的 selector 標籤：帶了就會被算進 Service �
 `networkPolicy.enabled: true` 時，hook 還需要 `networkPolicy.allowHelmTest: true`；
 它只會在 7457 埠多加一個 ingress 來源（本 release 的 hook Pod），不動任何 pod template。
 
+每個 GET 都會重試（`helmTest.retries`，預設 15 次、間隔 2 秒）。這不是湊數：hook Pod
+在執行前幾秒才被建立，而放行它的 NetworkPolicy 是以「Pod IP 的 ipset」實作的，policy
+controller 需要時間學到這個 IP；太早連線會被 reject，症狀看起來就跟 Service 壞掉一模
+一樣。實測只試一次的話，連續執行 `helm test` 大約有一半會失敗。
+
+hook Pod 在跑完後會留著（`helm.sh/hook-delete-policy: before-hook-creation`），所以
+`kubectl -n pi-agent-woow logs od-test-connection` 還看得到它當時看到什麼；下一次
+`helm test` 會把它換掉。
+
 **解除安裝不會刪資料。** `keepOnUninstall: true`（預設）會讓兩個 PVC——以及由 chart
 建立的 extra-env Secret——都帶上 `helm.sh/resource-policy: keep`，且位於 `Retain` 的
 StorageClass 上。

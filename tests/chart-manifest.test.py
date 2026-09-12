@@ -307,13 +307,21 @@ check(deployment_selector and not all(hook_labels.get(key) == value for key, val
 hook_spec = hook.get("spec") or {}
 check(hook_spec.get("restartPolicy") == "Never", "a test hook must not restart")
 check(hook_spec.get("automountServiceAccountToken") is False, "the test hook must not mount a ServiceAccount token")
-check(not hook_spec.get("volumes"), "the test hook is read-only: it must mount no volume, least of all the data PVC")
+hook_volumes = {v.get("name"): v for v in hook_spec.get("volumes") or []}
+check(set(hook_volumes) <= {"tmp"},
+      f"the test hook must mount nothing but its own emptyDir, got {sorted(hook_volumes)}")
+check("emptyDir" in (hook_volumes.get("tmp") or {}),
+      "the test hook's /tmp must be an emptyDir, never a PVC")
+for volume in hook_spec.get("volumes") or []:
+    check("persistentVolumeClaim" not in volume,
+          "the test hook must never mount a PVC; it is a read-only probe")
 hook_containers = hook_spec.get("containers") or []
 check(len(hook_containers) == 1, "the test hook must run one container")
 if hook_containers:
     probe = hook_containers[0]
     check(probe.get("image") == image, "the test hook must reuse the already-pinned OD image, not pull a new one")
-    check(not probe.get("volumeMounts"), "the test hook must mount nothing")
+    check({m.get("mountPath") for m in probe.get("volumeMounts") or []} <= {"/tmp"},
+          "the test hook may mount nothing but its own writable /tmp")
     probe_security = probe.get("securityContext") or {}
     check(probe_security.get("runAsUser") == 1001 and probe_security.get("runAsNonRoot") is True,
           "the test hook must run unprivileged")

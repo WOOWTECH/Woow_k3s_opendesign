@@ -42,18 +42,50 @@ spec:
         - -ceu
         - |
           endpoint="http://{{ include "opendesign.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}"
+          # RETRY, and not as garnish. This pod is created seconds before it
+          # runs, and the NetworkPolicy that admits it is enforced from an ipset
+          # keyed on the pod's IP, which the policy controller has to learn
+          # first. Connect too early and the packet is REJECTED -- the probe
+          # sees a flat "connection refused" from a Service whose endpoint is
+          # perfectly healthy. Measured back-to-back `helm test` runs failing
+          # that way roughly half the time without this loop.
+          # A pod that is genuinely down still fails, {{ .Values.helmTest.retries }} attempts later.
+          attempts={{ .Values.helmTest.retries }}
+          get() {
+            path=$1
+            i=1
+            while :; do
+              if body="$(wget -q -O- --timeout=10 "${endpoint}${path}" 2>/tmp/wget.err)"; then
+                printf '%s' "${body}"
+                return 0
+              fi
+              if [ "${i}" -ge "${attempts}" ]; then
+                echo "[test] GET ${path} still failing after ${i} attempt(s):" >&2
+                cat /tmp/wget.err >&2
+                return 1
+              fi
+              echo "[test] GET ${path} attempt ${i} failed ($(tr -d '\n' </tmp/wget.err)), retrying" >&2
+              i=$((i + 1))
+              sleep 2
+            done
+          }
           echo "[test] GET ${endpoint}/api/health"
-          health="$(wget -q -O- --timeout=10 "${endpoint}/api/health")"
+          health="$(get /api/health)"
           echo "[test] ${health}"
           case "${health}" in
             *'"ok":true'*) ;;
             *) echo "[test] /api/health did not report ok:true" >&2; exit 1 ;;
           esac
           echo "[test] GET ${endpoint}/api/version"
-          version="$(wget -q -O- --timeout=10 "${endpoint}/api/version")"
+          version="$(get /api/version)"
           echo "[test] ${version}"
           test -n "${version}"
           echo "[test] the Service reaches the loopback daemon through the sidecar"
+      volumeMounts:
+        # readOnlyRootFilesystem: the only thing written anywhere is the captured
+        # wget stderr, in this emptyDir.
+        - name: tmp
+          mountPath: /tmp
       securityContext:
         runAsUser: 1001
         runAsGroup: 1001
@@ -64,4 +96,7 @@ spec:
           drop: ["ALL"]
       resources:
         {{- toYaml .Values.helmTest.resources | nindent 8 }}
+  volumes:
+    - name: tmp
+      emptyDir: {}
 {{- end }}

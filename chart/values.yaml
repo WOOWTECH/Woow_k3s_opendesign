@@ -270,6 +270,12 @@ probes:
 # With networkPolicy.enabled: true it also needs networkPolicy.allowHelmTest.
 helmTest:
   enabled: true
+  # Attempts per GET, two seconds apart. The hook pod is created seconds before
+  # it runs and the NetworkPolicy admitting it is enforced from an ipset keyed on
+  # its IP, which the policy controller has to learn first; connecting too early
+  # is REJECTED and looks exactly like a broken Service. One attempt made
+  # back-to-back `helm test` runs fail about half the time.
+  retries: 15
   resources:
     requests:
       cpu: 20m
