@@ -39,6 +39,7 @@ require_paths "chart lane" \
   "$REPO_ROOT/tests/values/extras.yaml" \
   "$REPO_ROOT/tests/values/no-keep.yaml" \
   "$REPO_ROOT/tests/values/no-public-url.yaml" \
+  "$REPO_ROOT/tests/values/extra-env-secret-ignored-data.yaml" \
   "$REPO_ROOT/deploy/woow-k3s/opendesign.yaml"
 
 mkdir -p "$ARTIFACTS"
@@ -141,6 +142,8 @@ render_must_fail "the same key in extraEnv and in the Secret" \
   "set in BOTH" --values tests/values/extra-env-secret-conflict.yaml
 render_must_fail "a Secret nothing would read" \
   "has no effect while" --values tests/values/extra-env-secret-orphan.yaml
+render_must_fail "data nothing would render" \
+  "nothing renders it" --values tests/values/extra-env-secret-ignored-data.yaml
 # Same layering: the schema rejects a moving tag and a malformed digest before
 # the template's own `fail` is reached.
 render_must_fail "an image pinned to a moving tag" \

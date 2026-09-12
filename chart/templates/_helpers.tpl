@@ -154,4 +154,7 @@ pod's environment by surprise.
 {{- if and $secretCfg.enabled $secretCfg.create (not $secretData) -}}
 {{- fail "opendesign.extraEnvSecret.create: true requires opendesign.extraEnvSecret.data to hold at least one key. Leave create: false to reference a Secret that already exists." -}}
 {{- end -}}
+{{- if and $secretData (not $secretCfg.create) -}}
+{{- fail "opendesign.extraEnvSecret.data is set but create is false, so nothing renders it and those values would silently never reach the container. Set create: true, or drop data and create the Secret out of band." -}}
+{{- end -}}
 {{- end -}}

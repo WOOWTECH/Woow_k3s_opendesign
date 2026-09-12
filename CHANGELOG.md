@@ -35,6 +35,11 @@ belong to the release that is allowed to restart something.
     `extraEnv` into a render failure;
   - `examples/secrets.example.yaml` documents both modes with example values,
     and `docs/MIGRATION.md` has the one-time migration for the live key.
+
+  Every way of getting that wrong is a render failure rather than a surprise at
+  runtime: `create: true` with no data or an empty value, `data` filled in while
+  `create` is false (nothing would render it), a Secret the Deployment would
+  never read, and the same key in both `extraEnv` and the Secret.
 - **`keepOnUninstall` (default `true`)** now owns `helm.sh/resource-policy:
   keep` for both PVCs and for a chart-created Secret, instead of an annotation
   map per PVC that could be edited out one at a time. The chart still renders no
