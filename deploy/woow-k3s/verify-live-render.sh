@@ -35,12 +35,13 @@ key=$(kubectl --context "$context" -n "$namespace" get configmap "$release-confi
   -o go-template='{{ if index .data "OPENROUTER_API_KEY" }}1{{ end }}')
 if [[ $key == 1 ]]; then
   umask 077
-  {
-    printf 'opendesign:\n  extraEnv:\n    OPENROUTER_API_KEY: '
-    kubectl --context "$context" -n "$namespace" get configmap "$release-config" \
-      -o go-template='{{ index .data "OPENROUTER_API_KEY" }}' | sed -e 's/^/"/' -e 's/$/"/'
-    printf '\n'
-  } >"$work/live-extra-env.yaml"
+  # json.dumps produces a quoted scalar that is valid YAML for any byte the
+  # value could contain, which hand-rolled quoting is not. The value is written
+  # to a mode-600 file inside $work and never reaches stdout.
+  kubectl --context "$context" -n "$namespace" get configmap "$release-config" \
+    -o go-template='{{ index .data "OPENROUTER_API_KEY" }}' \
+    | python3 -c 'import json, sys; print("opendesign:\n  extraEnv:\n    OPENROUTER_API_KEY: " + json.dumps(sys.stdin.read()))' \
+    >"$work/live-extra-env.yaml"
   extra=(-f "$work/live-extra-env.yaml")
   echo "note: the live cleartext OPENROUTER_API_KEY was read from ConfigMap $release-config (never printed)"
 else
@@ -51,19 +52,41 @@ helm --kube-context "$context" -n "$namespace" get manifest "$release" >"$work/l
 helm template "$release" "$root/chart" -n "$namespace" -f "$values" "${extra[@]}" --no-hooks >"$work/rendered.yaml"
 
 python3 - "$work/live.yaml" "$work/rendered.yaml" <<'PY'
-import re, sys
+import difflib
+import re
+import sys
+
+
 def norm(path):
     text = open(path, encoding="utf-8").read()
     text = "\n".join(line.rstrip() for line in text.split("\n"))
     return re.sub(r"\n{2,}", "\n", text).strip() + "\n"
+
+
+# Both sides legitimately contain the live cleartext OPENROUTER_API_KEY, and a
+# unified diff prints three lines of CONTEXT around every change -- which would
+# put that value on stdout because of an unrelated difference two lines away.
+# Equality is checked on the real text; only the printed diff is redacted.
+CREDENTIALISH = re.compile(r"^(\s*[A-Za-z0-9_.\-]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)\s*:\s*).+$",
+                           re.IGNORECASE | re.MULTILINE)
+
+
+def redact(text):
+    return CREDENTIALISH.sub(r"\1<redacted>", text)
+
+
 live, rendered = norm(sys.argv[1]), norm(sys.argv[2])
 if live == rendered:
     print("helm get manifest == helm template (whitespace-normalised): the chart would roll nothing")
     raise SystemExit(0)
-import difflib
-sys.stdout.writelines(difflib.unified_diff(
-    live.splitlines(keepends=True), rendered.splitlines(keepends=True),
+printable = list(difflib.unified_diff(
+    redact(live).splitlines(keepends=True), redact(rendered).splitlines(keepends=True),
     fromfile="live (helm get manifest)", tofile="rendered (helm template)"))
+if printable:
+    sys.stdout.writelines(printable)
+else:
+    print("the ONLY difference is the value of a redacted credential-shaped key; "
+          "compare it by hand, it is not printed here")
 print("\nRENDER DIFFERS FROM LIVE", file=sys.stderr)
 raise SystemExit(1)
 PY
