@@ -103,6 +103,23 @@ render_ok "every opt-in on"      rendered-extras.yaml --values tests/values/extr
 render_ok "keepOnUninstall off"  rendered-nokeep.yaml --values tests/values/no-keep.yaml
 render_ok "live instance values" rendered-live.yaml   --values deploy/woow-k3s/opendesign.yaml
 
+# chart/ci/*-values.yaml is the chart-testing convention: one file per
+# configuration `ct lint` should install. They are excluded from the packaged
+# tarball by .helmignore, which also means nothing would ever notice them
+# rotting, so they are rendered here too.
+echo "== helm template: the chart-testing fixtures in $CHART_DIR/ci =="
+shopt -s nullglob
+ci_fixtures=("$CHART_DIR"/ci/*-values.yaml)
+shopt -u nullglob
+if (( ${#ci_fixtures[@]} == 0 )); then
+  echo 'FAIL: no chart/ci/*-values.yaml fixtures found; chart-testing would have nothing to install.' >&2
+  exit 1
+fi
+for fixture in "${ci_fixtures[@]}"; do
+  helm lint "$CHART_DIR" --values "$fixture" >/dev/null
+  render_ok "ci/$(basename "$fixture")" "rendered-ci-$(basename "$fixture")" --values "$fixture"
+done
+
 echo "== helm template: every render-time guard must fire =="
 render_must_fail "an empty publicUrl" \
   "publicUrl is required" --values tests/values/no-public-url.yaml
