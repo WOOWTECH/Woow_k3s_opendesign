@@ -52,12 +52,18 @@ image:
   # Blank = use .Chart.Version (2.0.1). The literal "latest" is rejected.
   tag: ""
   # sha256:... -- when set it WINS over tag and the image is pulled by digest.
-  # The release process fills this in from the `docker buildx` output.
+  # The release job PRINTS the published digest in its GitHub step summary; it
+  # does not write it back here, so pinning it is a manual step -- either in
+  # this file at release time, or per release in its instance values, as
+  # deploy/woow-k3s/opendesign.yaml does.
   digest: ""
   pullPolicy: IfNotPresent
 
 # The package is published public, as ghcr.io/woowtech/woow-k3s-pi-agent is
-# (the live pi-agent Deployments pull it with no pull secret).
+# (the live pi-agent Deployments pull it with no pull secret), so nothing here
+# is required. The live `opendesign` release nevertheless sets
+# imagePullSecrets: [ghcr-woowtech]; it is harmless, and removing it would
+# rewrite a running pod template for no gain.
 imagePullSecrets: []
 
 # ── nginx sidecar ──────────────────────────────────────────────────────────

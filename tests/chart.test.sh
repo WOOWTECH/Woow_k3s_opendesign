@@ -130,6 +130,14 @@ render_must_fail "an image pinned to a moving tag" \
   "at '/image/tag'" --set image.tag=latest --values tests/values/minimal.yaml
 render_must_fail "a malformed image digest" \
   "at '/image/digest'" --set image.digest=sha256:nothex --values tests/values/minimal.yaml
+# A mistyped key used to be silently ignored, which is how a chart ends up
+# running with a setting its author believes is in effect.
+render_must_fail "a mistyped top-level key" \
+  "additional properties 'imagePullSecret' not allowed" \
+  --set imagePullSecret=oops --values tests/values/minimal.yaml
+render_must_fail "a mistyped key inside extraEnvSecret" \
+  "additional properties 'enable' not allowed" \
+  --set opendesign.extraEnvSecret.enable=true --values tests/values/minimal.yaml
 
 # -------------------------------------------------------------- data retention
 # `helm uninstall` must never be able to take the data with it. This is the

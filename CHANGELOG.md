@@ -58,6 +58,15 @@ belong to the release that is allowed to restart something.
   have rendered a different chart. `tests/chart.test.sh` now fails if any file
   under `chart/` is ignored or untracked, and `tests/validate.py` fails if a
   pattern loses its leading `/`.
+- **A mistyped values key is now a render failure.** `values.schema.json` sets
+  `additionalProperties: false` at the top level (it already did inside
+  `service`), so `imagePullSecret` for `imagePullSecrets` is rejected instead of
+  silently ignored — the failure mode where a chart runs with a setting its
+  author believes is in effect. `tests/validate.py` also asserts that every key
+  `values.yaml` ships is declared in the schema.
+- Two stale comments in `values.yaml`: the release job prints the published
+  digest in its step summary and does **not** write it back, and the live
+  release does set `imagePullSecrets` even though the package is public.
 - CI/tests: `helm lint` + `helm template` + `kubeconform -strict` over every
   values combination the repo ships (defaults, minimal, full, every opt-in on,
   `keepOnUninstall: false`, and the live instance values), one negative fixture

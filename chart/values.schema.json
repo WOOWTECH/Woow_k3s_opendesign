@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft-07/schema#",
   "title": "Woow OpenDesign chart values",
   "type": "object",
+  "description": "additionalProperties is false on purpose: a mistyped top-level key (imagePullSecret for imagePullSecrets, say) used to be silently ignored, which is the one failure mode this chart is built to avoid. Every key an install may set is listed below.",
+  "additionalProperties": false,
   "required": ["publicUrl", "keepOnUninstall", "image", "nginx", "opendesign", "service", "persistence", "backup", "networkPolicy", "probes", "helmTest"],
   "properties": {
     "nameOverride": { "type": "string" },
@@ -29,6 +31,7 @@
       }
     },
     "imagePullSecrets": { "type": "array" },
+    "global": { "type": "object" },
 
     "nginx": {
       "type": "object",

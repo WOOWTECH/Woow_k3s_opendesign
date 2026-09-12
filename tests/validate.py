@@ -125,6 +125,14 @@ check(backup_values.get("enabled") is True, "backup must default to enabled; Lon
 check((backup_values.get("persistence") or {}).get("storageClassName") == "longhorn", "backup PVC must use the `longhorn` (Retain) class")
 check(bool(values.get("nginx", {}).get("requireOriginOnMutation", False)), "nginx.requireOriginOnMutation must default true")
 check((CHART / "values.schema.json").is_file(), "values.schema.json must ship so `helm lint` enforces the values contract")
+schema = json.loads((CHART / "values.schema.json").read_text(encoding="utf-8"))
+check(schema.get("additionalProperties") is False,
+      "values.schema.json must set additionalProperties: false at the top level; a mistyped key "
+      "(imagePullSecret for imagePullSecrets) would otherwise be silently ignored")
+# Everything values.yaml ships must be declared, or the schema rejects the
+# chart's own defaults.
+undeclared = sorted(set(values) - set(schema.get("properties") or {}))
+check(not undeclared, f"values.yaml ships key(s) the schema does not declare: {undeclared}")
 
 # ------------------------------------------------------------- secret hygiene
 # This is the check that would have caught values.yaml:157
