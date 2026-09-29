@@ -1,0 +1,176 @@
+{{- if .Values.console.enabled }}
+{{- $consoleImage := printf "%s:%s" .Values.console.image.repository (.Values.console.image.tag | default "latest") -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "open-design.console.fullname" . }}
+  labels:
+    {{- include "open-design.console.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "open-design.console.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "open-design.console.labels" . | nindent 8 }}
+        {{- with .Values.console.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Roll the console pod when its ConfigMap (entrypoint/connect/app.py) changes
+        # — the app code is injected from the ConfigMap, so a chart edit must restart
+        # the pod to take effect (e.g. ttyd -b base-path). gap #49.
+        checksum/console-config: {{ include (print $.Template.BasePath "/console-configmap.yaml") . | sha256sum }}
+        {{- with .Values.console.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "open-design.console.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.console.terminationGracePeriodSeconds }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: console
+          {{- if .Values.console.runtimeInstall }}
+          # runtimeInstall mode: faithful upstream — python:3.9-slim + bootstrap
+          # that downloads ttyd/kubectl and pip-installs flask at EVERY start.
+          # Requires egress to github.com / dl.k8s.io / pypi.
+          image: {{ .Values.console.runtimeInstallBaseImage | quote }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "[init] Installing system packages..."
+              apt-get update -qq && apt-get install -y -qq curl ca-certificates > /dev/null 2>&1
+
+              echo "[init] Installing ttyd..."
+              curl -sLo /usr/local/bin/ttyd \
+                https://github.com/tsl0922/ttyd/releases/download/{{ .Values.console.ttydVersion }}/ttyd.x86_64
+              chmod +x /usr/local/bin/ttyd
+
+              echo "[init] Installing kubectl..."
+              KUBECTL_VER=$(curl -sL https://dl.k8s.io/release/stable.txt)
+              curl -sLo /usr/local/bin/kubectl \
+                "https://dl.k8s.io/release/${KUBECTL_VER}/bin/linux/amd64/kubectl"
+              chmod +x /usr/local/bin/kubectl
+
+              echo "[init] Installing Python dependencies..."
+              pip install -q flask==3.1.0 requests==2.32.3 > /dev/null 2>&1
+
+              echo "[init] Setting up app..."
+              mkdir -p /app/templates
+              cp /mnt/scripts/app.py /app/app.py
+              cp /mnt/scripts/entrypoint.py /app/entrypoint.py
+              cp /mnt/scripts/connect.sh /app/connect.sh
+              cp /mnt/html/index.html /app/templates/index.html
+              chmod +x /app/connect.sh
+
+              echo "[init] Starting console services..."
+              exec python /app/entrypoint.py
+          {{- else }}
+          # baked mode (default): the image already ships ttyd + kubectl + python +
+          # flask. Only copy the ConfigMap app in and run — NO network downloads.
+          image: {{ $consoleImage | quote }}
+          imagePullPolicy: {{ .Values.console.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              echo "[init] Setting up app..."
+              mkdir -p /app/templates
+              cp /mnt/scripts/app.py /app/app.py
+              cp /mnt/scripts/entrypoint.py /app/entrypoint.py
+              cp /mnt/scripts/connect.sh /app/connect.sh
+              cp /mnt/html/index.html /app/templates/index.html
+              chmod +x /app/connect.sh
+
+              echo "[init] Starting console services..."
+              exec python /app/entrypoint.py
+          {{- end }}
+          ports:
+            - containerPort: {{ .Values.console.service.dashboardPort }}
+              name: http
+            - containerPort: {{ .Values.console.service.ttydPort }}
+              name: ttyd
+          env:
+            - name: NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            # Daemon discovery targets — env-driven so the console works under any
+            # release name (svc-{ref[:8]}), not the upstream hard-coded values.
+            - name: POD_LABEL
+              value: "app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/name={{ include "open-design.name" . }}"
+            - name: DAEMON_CONTAINER
+              value: {{ .Chart.Name | quote }}
+            - name: DAEMON_DEPLOYMENT
+              value: {{ include "open-design.fullname" . | quote }}
+            - name: DAEMON_PORT
+              value: {{ .Values.service.targetPort | quote }}
+            - name: CONSOLE_TTYD_PORT
+              value: {{ .Values.console.service.ttydPort | quote }}
+            - name: CONSOLE_DASHBOARD_PORT
+              value: {{ .Values.console.service.dashboardPort | quote }}
+            {{- if .Values.console.externalPath }}
+            # Sub-path the auth-proxy exposes ttyd under → ttyd runs with `-b` so its
+            # asset/WS URLs match (gap #49). Empty/unset → ttyd served at root.
+            - name: CONSOLE_BASE_PATH
+              value: {{ .Values.console.externalPath | quote }}
+            {{- end }}
+            # Console gate (Option C — "同一閘"): ttyd basic-auth AND the Flask
+            # dashboard basic-auth both use the tenant admin_password (user below).
+            - name: CONSOLE_BASIC_USER
+              value: {{ include "open-design.basicAuthUsername" . | quote }}
+            - name: TUI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-design.secretName" . }}
+                  key: admin_password
+          volumeMounts:
+            - name: scripts
+              mountPath: /mnt/scripts
+            - name: html
+              mountPath: /mnt/html
+          resources:
+            {{- toYaml .Values.console.resources | nindent 12 }}
+          {{- with .Values.console.readinessProbe }}
+          readinessProbe:
+            tcpSocket:
+              port: {{ $.Values.console.service.dashboardPort }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.console.livenessProbe }}
+          livenessProbe:
+            tcpSocket:
+              port: {{ $.Values.console.service.dashboardPort }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "open-design.console.scriptsConfigMapName" . }}
+            defaultMode: 0755
+        - name: html
+          configMap:
+            name: {{ include "open-design.console.fullname" . }}-html
+            defaultMode: 0644
+{{- end }}

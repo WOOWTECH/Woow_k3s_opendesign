@@ -1,17 +1,16 @@
 {{/*
-Chart name, overridable.
+open-design helm chart helpers.
+
+Per-instance service running the OpenDesign daemon (+ optional console). Deployed
+per-tenant by paas-operator with release name svc-{reference_id[:8]} into a
+paas-ws-* namespace.
 */}}
-{{- define "opendesign.name" -}}
+
+{{- define "open-design.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{/*
-Fully qualified app name. `helm install opendesign .` yields plain
-"opendesign" for every object, which is what the docs and the NPM proxy host
-assume; a differently named release simply gets its own prefix instead of
-colliding with an existing one.
-*/}}
-{{- define "opendesign.fullname" -}}
+{{- define "open-design.fullname" -}}
 {{- if .Values.fullnameOverride -}}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
 {{- else -}}
@@ -24,137 +23,160 @@ colliding with an existing one.
 {{- end -}}
 {{- end -}}
 
-{{- define "opendesign.chart" -}}
+{{- define "open-design.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
-{{/*
-Selector labels. `app` mirrors the live pi-agent fleet convention
-(app=<release>), which is what the NetworkPolicy podSelector and the backup
-CronJob's podAffinity match on.
-*/}}
-{{- define "opendesign.selectorLabels" -}}
-app: {{ include "opendesign.fullname" . }}
-app.kubernetes.io/name: {{ include "opendesign.name" . }}
+{{/* ── Daemon labels ───────────────────────────────────────────────────────── */}}
+
+{{/* Selector labels (stable across versions — used by Deployment/Service selectors). */}}
+{{- define "open-design.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "open-design.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
-{{- define "opendesign.labels" -}}
-{{ include "opendesign.selectorLabels" . }}
-{{ include "opendesign.nonSelectorLabels" . }}
-{{- end -}}
-
-{{/*
-The public origin, validated. Empty or non-https is a hard render failure --
-the value drives OD_ALLOWED_ORIGINS, and getting it wrong silently disables
-OpenDesign's cross-site rejection.
-*/}}
-{{- define "opendesign.publicUrl" -}}
-{{- $url := required "publicUrl is required: set it to the https:// origin this instance is reached on through Nginx Proxy Manager, e.g. --set publicUrl=https://od-woow-k3s.woowtech.io" .Values.publicUrl -}}
-{{- if not (regexMatch "^https://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+(:[0-9]{1,5})?$" $url) -}}
-{{- fail (printf "publicUrl must be an https:// origin with no path, e.g. https://od-woow-k3s.woowtech.io (got %q)" $url) -}}
-{{- end -}}
-{{- $url -}}
-{{- end -}}
-
-{{/*
-Image reference: digest wins over tag. "latest" is rejected outright -- an
-unpinned tag is exactly what made the previous chart unreproducible.
-*/}}
-{{- define "opendesign.image" -}}
-{{- $tag := default .Chart.Version .Values.image.tag -}}
-{{- if eq (lower (toString $tag)) "latest" -}}
-{{- fail "image.tag must not be \"latest\": pin an immutable tag or set image.digest" -}}
-{{- end -}}
-{{- if .Values.image.digest -}}
-{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" .Values.image.digest) -}}
-{{- fail (printf "image.digest must look like sha256:<64 hex> (got %q)" .Values.image.digest) -}}
-{{- end -}}
-{{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
-{{- else -}}
-{{- printf "%s:%s" .Values.image.repository (toString $tag) -}}
-{{- end -}}
-{{- end -}}
-
-{{- define "opendesign.nginxImage" -}}
-{{- $tag := toString .Values.nginx.image.tag -}}
-{{- if eq (lower $tag) "latest" -}}
-{{- fail "nginx.image.tag must not be \"latest\"" -}}
-{{- end -}}
-{{- printf "%s:%s" .Values.nginx.image.repository $tag -}}
-{{- end -}}
-
-{{/*
-Labels that are NOT part of any selector.
-
-The Service and the Deployment both select on `opendesign.selectorLabels`, so
-any pod that carries the full label set joins the Service's EndpointSlice --
-including short-lived helper pods that listen on nothing. The `helm test` hook
-pod therefore carries only these labels plus a component marker, which is why
-`helm test` cannot black-hole live traffic on port {{ .Values.nginx.port }}.
-*/}}
-{{- define "opendesign.nonSelectorLabels" -}}
+{{/* Common labels. */}}
+{{- define "open-design.labels" -}}
+helm.sh/chart: {{ include "open-design.chart" . }}
+{{ include "open-design.selectorLabels" . }}
+app.kubernetes.io/component: daemon
+app.kubernetes.io/part-of: open-design
 app.kubernetes.io/managed-by: {{ .Release.Service }}
-app.kubernetes.io/part-of: opendesign
+{{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-helm.sh/chart: {{ include "opendesign.chart" . }}
+{{- end }}
 {{- end -}}
 
-{{/*
-Name of the Secret that supplies extra environment to the OpenDesign
-container. Defaults to <fullname>-extra-env; `create: false` means the Secret
-is expected to exist already (created out of band, never by this chart).
-*/}}
-{{- define "opendesign.extraEnvSecretName" -}}
-{{- $cfg := .Values.opendesign.extraEnvSecret -}}
-{{- if $cfg.name -}}
-{{- $cfg.name -}}
+{{/* ── Console labels ──────────────────────────────────────────────────────── */}}
+
+{{- define "open-design.console.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "open-design.name" . }}-console
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{- define "open-design.console.labels" -}}
+helm.sh/chart: {{ include "open-design.chart" . }}
+{{ include "open-design.console.selectorLabels" . }}
+app.kubernetes.io/component: console
+app.kubernetes.io/part-of: open-design
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+{{- end -}}
+
+{{/* ── Names ───────────────────────────────────────────────────────────────── */}}
+
+{{- define "open-design.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create -}}
+{{- default (include "open-design.fullname" .) .Values.serviceAccount.name -}}
 {{- else -}}
-{{- printf "%s-extra-env" (include "opendesign.fullname" .) -}}
+{{- default "default" .Values.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Daemon Service name — service.name override, else the release fullname. */}}
+{{- define "open-design.serviceName" -}}
+{{- default (include "open-design.fullname" .) .Values.service.name -}}
+{{- end -}}
+
+{{- define "open-design.configMapName" -}}
+{{- printf "%s-config" (include "open-design.fullname" .) -}}
+{{- end -}}
+
+{{- define "open-design.secretName" -}}
+{{- if .Values.auth.existingSecret -}}
+{{- .Values.auth.existingSecret -}}
+{{- else -}}
+{{- printf "%s-secrets" (include "open-design.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* nginx auth-proxy config ConfigMap name. */}}
+{{- define "open-design.authProxyConfigMapName" -}}
+{{- printf "%s-authproxy" (include "open-design.fullname" .) -}}
+{{- end -}}
+
+{{- define "open-design.dataPvcName" -}}
+{{- printf "%s-data" (include "open-design.fullname" .) -}}
+{{- end -}}
+
+{{- define "open-design.homePvcName" -}}
+{{- printf "%s-home" (include "open-design.fullname" .) -}}
+{{- end -}}
+
+{{/* ── Console names ───────────────────────────────────────────────────────── */}}
+
+{{- define "open-design.console.fullname" -}}
+{{- printf "%s-console" (include "open-design.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "open-design.console.serviceAccountName" -}}
+{{- include "open-design.console.fullname" . -}}
+{{- end -}}
+
+{{- define "open-design.console.scriptsConfigMapName" -}}
+{{- printf "%s-scripts" (include "open-design.console.fullname" .) -}}
+{{- end -}}
+
+{{/*
+Resolve the daemon API token / TUI password with self-generate + persist:
+  (1) explicit .Values.auth.<field> wins (platform helm_default_values / --set);
+  (2) else reuse the value already in the live chart-managed Secret so `helm
+      upgrade` does NOT regenerate it (a naive rand would churn the Secret every
+      sync); only generate when none exists yet.
+Ignored entirely when auth.existingSecret is set (chart creates no Secret).
+Usage: {{ include "open-design.resolveSecretValue" (dict "ctx" . "explicit" .Values.auth.odApiToken "key" "OD_API_TOKEN" "gen" "hex32") }}
+*/}}
+{{- define "open-design.resolveSecretValue" -}}
+{{- $ctx := .ctx -}}
+{{- $val := .explicit -}}
+{{- if not $val -}}
+  {{- $live := lookup "v1" "Secret" $ctx.Release.Namespace (include "open-design.secretName" $ctx) -}}
+  {{- if $live -}}
+    {{- with $live.data -}}
+      {{- with (index . $.key) -}}
+        {{- $val = . | b64dec -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- if not $val -}}
+  {{- if eq .gen "hex32" -}}
+    {{- $val = randAlphaNum 64 | lower | trunc 64 -}}
+  {{- else -}}
+    {{- $val = randAlphaNum 24 -}}
+  {{- end -}}
+{{- end -}}
+{{- $val -}}
+{{- end -}}
+
+{{/*
+Image used by the seed-home initContainer. homeSeed.image overrides; otherwise
+the DAEMON image itself — it already ships /etc/skel and is guaranteed present
+on the node (no extra pull secret, no extra egress, no version skew).
+*/}}
+{{- define "open-design.homeSeedImage" -}}
+{{- if .Values.homeSeed.image -}}
+{{- .Values.homeSeed.image -}}
+{{- else -}}
+{{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) -}}
 {{- end -}}
 {{- end -}}
 
 {{/*
-Keys that must never be supplied from outside the chart, and the credential
-shape guard.
-
-`opendesign.extraEnv` lands in the -config ConfigMap in CLEARTEXT: a ConfigMap
-is readable by anything with get on ConfigMaps in the namespace and is echoed
-back by `helm get values`. Credentials belong in
-`opendesign.extraEnvSecret` instead. `rejectSecretShapedExtraEnv: true` turns
-that from advice into a render failure; it ships false because the live
-release still carries one such key and this chart may not change a running
-pod's environment by surprise.
+Tenant basic-auth username — ONE credential for the auth-proxy htpasswd and the
+console (ttyd -c + Flask dashboard). The platform lets tenants change it, so it
+is validated here rather than trusted: it is written verbatim into an htpasswd
+line (`user:{PLAIN}pw`, nginx splits on the FIRST ':') and into ttyd's
+`-c user:pw` argument. A ':' or whitespace would silently split the credential
+into a different user/password pair; an empty value would lock everyone out.
+Fail the render instead — helm keeps the old release, the tenant keeps access.
 */}}
-{{- define "opendesign.validateExtraEnv" -}}
-{{- $reserved := list "OD_BIND_HOST" "OD_PORT" "OD_DATA_DIR" "OD_ALLOWED_ORIGINS" "OD_PUBLIC_BASE_URL" "OD_API_TOKEN" "OD_DISABLE_API_AUTH" "HOME" "PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH" "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD" -}}
-{{- $secretCfg := .Values.opendesign.extraEnvSecret -}}
-{{- $secretData := $secretCfg.data | default dict -}}
-{{- range $k, $v := .Values.opendesign.extraEnv -}}
-{{- if has $k $reserved -}}
-{{- fail (printf "opendesign.extraEnv must not set %s: it is chart-owned. OD_API_TOKEN and OD_DISABLE_API_AUTH in particular are unnecessary behind a loopback bind and must never be set here." $k) -}}
+{{- define "open-design.basicAuthUsername" -}}
+{{- $u := .Values.authProxy.basicAuth.username | toString -}}
+{{- if not (regexMatch "^[A-Za-z0-9._@-]{1,64}$" $u) -}}
+{{- fail (printf "authProxy.basicAuth.username %q is invalid: 1-64 characters from A-Z a-z 0-9 . _ @ -" $u) -}}
 {{- end -}}
-{{- if hasKey $secretData $k -}}
-{{- fail (printf "%s is set in BOTH opendesign.extraEnv and opendesign.extraEnvSecret.data. envFrom order would decide which one wins; pick one." $k) -}}
-{{- end -}}
-{{- if $.Values.opendesign.rejectSecretShapedExtraEnv -}}
-{{- if regexMatch "(?i)(_?API_?KEY|_?TOKEN|_?SECRET|_?PASSWORD|_?PASSWD)$" $k -}}
-{{- fail (printf "opendesign.extraEnv.%s looks like a credential and opendesign.extraEnv is rendered into a cleartext ConfigMap. Move it to opendesign.extraEnvSecret (set enabled: true and reference an existing Secret), or set opendesign.rejectSecretShapedExtraEnv: false to accept the cleartext." $k) -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
-{{- range $k, $v := $secretData -}}
-{{- if has $k $reserved -}}
-{{- fail (printf "opendesign.extraEnvSecret.data must not set %s: it is chart-owned." $k) -}}
-{{- end -}}
-{{- end -}}
-{{- if and $secretCfg.create (not $secretCfg.enabled) -}}
-{{- fail "opendesign.extraEnvSecret.create: true has no effect while opendesign.extraEnvSecret.enabled is false -- the Deployment would never read the Secret. Set enabled: true." -}}
-{{- end -}}
-{{- if and $secretCfg.enabled $secretCfg.create (not $secretData) -}}
-{{- fail "opendesign.extraEnvSecret.create: true requires opendesign.extraEnvSecret.data to hold at least one key. Leave create: false to reference a Secret that already exists." -}}
-{{- end -}}
-{{- if and $secretData (not $secretCfg.create) -}}
-{{- fail "opendesign.extraEnvSecret.data is set but create is false, so nothing renders it and those values would silently never reach the container. Set create: true, or drop data and create the Secret out of band." -}}
-{{- end -}}
+{{- $u -}}
 {{- end -}}

@@ -1,0 +1,129 @@
+{{- if .Values.authProxy.enabled }}
+{{- $daemonPort := .Values.service.targetPort -}}
+# nginx auth-proxy config (Option C). Fronts the loopback-bound daemon: serves the
+# UI at / and proxies /api/* to 127.0.0.1:<daemonPort>, gating everything with HTTP
+# basic-auth (user = authProxy.basicAuth.username, password = admin_password via the
+# .htpasswd written by the init container). /api/health,ready,version stay OPEN for
+# the kubelet + monitoring. SSE / websockets friendly. No bearer injection needed —
+# nginx reaches the daemon over loopback, which the daemon exempts from its token guard.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open-design.authProxyConfigMapName" . }}
+  labels:
+    {{- include "open-design.labels" . | nindent 4 }}
+data:
+  # Main nginx config — mounted over /etc/nginx/nginx.conf (subPath) to PIN
+  # worker_processes. The base image (nginx-unprivileged) defaults to
+  # `worker_processes auto`, which forks one worker per HOST cpu and is NOT
+  # cgroup-aware: on a high-core node (e.g. 256 vCPU) that is 256 workers → the
+  # sidecar's small memory limit is blown → OOMKilled (137) CrashLoop. Mirrors the
+  # image default (pid + all temp paths under /tmp so nginx stays non-root-writable),
+  # overriding only worker_processes / worker_connections.
+  nginx.conf: |
+    worker_processes {{ .Values.authProxy.workerProcesses | default 2 }};
+    error_log  /var/log/nginx/error.log notice;
+    pid        /tmp/nginx.pid;
+
+    events {
+      worker_connections {{ .Values.authProxy.workerConnections | default 1024 }};
+    }
+
+    http {
+      proxy_temp_path /tmp/proxy_temp;
+      client_body_temp_path /tmp/client_temp;
+      fastcgi_temp_path /tmp/fastcgi_temp;
+      uwsgi_temp_path /tmp/uwsgi_temp;
+      scgi_temp_path /tmp/scgi_temp;
+
+      include       /etc/nginx/mime.types;
+      default_type  application/octet-stream;
+
+      log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                        '$status $body_bytes_sent "$http_referer" '
+                        '"$http_user_agent" "$http_x_forwarded_for"';
+      access_log  /var/log/nginx/access.log  main;
+
+      sendfile        on;
+      keepalive_timeout  65;
+
+      include /etc/nginx/conf.d/*.conf;
+    }
+  default.conf: |
+    map $http_upgrade $connection_upgrade {
+      default upgrade;
+      ''      close;
+    }
+
+    server {
+      listen {{ .Values.authProxy.port }};
+      server_name _;
+
+      client_max_body_size 100m;
+
+      # nginx-LOCAL liveness stub — returns 200 without touching the daemon, so the
+      # sidecar's livenessProbe reflects nginx health only (a daemon outage must not
+      # restart this container).
+      location = /healthz { auth_basic off; access_log off; return 200 "ok\n"; }
+
+      # Probes — OPEN (no basic-auth) so the kubelet and monitoring can reach them.
+      location = /api/health  { auth_basic off; proxy_pass http://127.0.0.1:{{ $daemonPort }}; }
+      location = /api/ready   { auth_basic off; proxy_pass http://127.0.0.1:{{ $daemonPort }}; }
+      location = /api/version { auth_basic off; proxy_pass http://127.0.0.1:{{ $daemonPort }}; }
+
+      {{- if and .Values.console.enabled .Values.console.externalPath }}
+      # Console web terminal (ttyd) — proxied to the console pod so a tenant reaches
+      # the TUI (`claude login`, whose ttyd execs into the daemon) at
+      # <public-url>{{ .Values.console.externalPath }} WITHOUT cluster access (gap #49).
+      # ttyd runs with `-b {{ .Values.console.externalPath }}` so its asset/WS URLs
+      # match this sub-path (no proxy_pass URI part → the original URI is forwarded
+      # unchanged, which ttyd's base-path expects). auth_basic off here: ttyd keeps
+      # its OWN basic-auth (same admin_password) — single prompt, and defense-in-depth
+      # if the console ClusterIP is reached in-cluster.
+      location = {{ .Values.console.externalPath }} {
+        # relative redirect — TLS terminates at the tunnel/CF, nginx listens plain
+        # :{{ .Values.authProxy.port }}, so an absolute redirect would leak http://host:{{ .Values.authProxy.port }}.
+        absolute_redirect off;
+        return 301 {{ .Values.console.externalPath }}/;
+      }
+      location {{ .Values.console.externalPath }}/ {
+        auth_basic off;
+        proxy_pass http://{{ include "open-design.console.fullname" . }}:{{ .Values.console.service.ttydPort }};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        # ttyd WebSocket + long-lived interactive terminal.
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+      }
+      {{- end }}
+
+      # UI + API — gated by basic-auth (the tenant credential). /api/* falls under
+      # this prefix, so it inherits the gate + the SSE-friendly settings.
+      location / {
+        {{- if .Values.authProxy.basicAuth.enabled }}
+        auth_basic "Open Design";
+        auth_basic_user_file /etc/nginx/auth/.htpasswd;
+        {{- else }}
+        auth_basic off;
+        {{- end }}
+        proxy_pass http://127.0.0.1:{{ $daemonPort }};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        # SSE / long-running streams (agent runs): no buffering, generous timeouts.
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+      }
+    }
+{{- end }}

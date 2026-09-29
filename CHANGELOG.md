@@ -1,5 +1,25 @@
 # Changelog
 
+## 3.0.0 — PaaS mirror (2026-09-29)
+
+This repository now **mirrors the WOOW PaaS open-design sources** from the
+internal Gitea instead of carrying its own single-instance chart. See
+[MIRROR.md](MIRROR.md) for the exact source commits.
+
+- `image/` — OpenDesign **0.24.1** on the upstream prebuilt `ghcr.io/nexu-io/od`
+  base, Claude Code **2.1.284**, OpenCode **1.18.33**, build-time version contract.
+- `console/` — ttyd web terminal + Flask dashboard.
+- `chart/` — per-tenant chart **0.2.0**: in-pod nginx basic-auth gate; the same
+  credentials protect the console; username and password are tenant-managed
+  from the PaaS service page.
+- CI validates only (lint, chart tests, no-push image builds).
+- The single-instance chart and everything below this entry are preserved on
+  the `legacy/k3s-single-instance` branch and the `v2.0.1` tag.
+
+---
+
+## Legacy single-instance chart history
+
 Versions here are chart versions. The chart version and the published image tag
 are the same number; `appVersion` is the OpenDesign version.
 

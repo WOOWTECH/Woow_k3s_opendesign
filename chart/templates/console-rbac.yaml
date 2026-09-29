@@ -1,0 +1,68 @@
+{{- if .Values.console.enabled }}
+# Console ServiceAccount — always created with the console (the console Deployment
+# references it unconditionally). The Role/RoleBinding below are gated on
+# console.rbac.create; with rbac.create=false the SA exists but has no grants
+# (console kubectl degrades, pod still schedules).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "open-design.console.serviceAccountName" . }}
+  labels:
+    {{- include "open-design.console.labels" . | nindent 4 }}
+{{- if .Values.console.rbac.create }}
+---
+# Namespaced Role, no cluster-wide grants. The Deployment + Secret rules ARE scoped
+# by name to this release's daemon. NOTE (np-audit #42 F-5): pods / pods/exec /
+# pods/log CANNOT be resourceName-scoped to a dynamically-named daemon pod, so those
+# verbs apply to ANY pod in THIS release's namespace — i.e. the console can exec into
+# sibling pods in the SAME tenant namespace. Containment rests on the platform's
+# per-tenant namespace isolation (paas-ws-*), NOT on this Role: the reachable pods are
+# the tenant's own. The app only ever targets the daemon (by label), but RBAC cannot
+# enforce that narrowing.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "open-design.console.fullname" . }}
+  labels:
+    {{- include "open-design.console.labels" . | nindent 4 }}
+rules:
+  # Find pods (namespace-scoped — see the F-5 note above).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # Exec into pods (critical for the ttyd terminal; namespace-scoped — F-5 note).
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  # Read pod logs (namespace-scoped — F-5 note).
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Restart the daemon Deployment (rollout restart = PATCH; scoped by name). The
+  # console never uses the scale subresource, so it is intentionally NOT granted.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["{{ include "open-design.fullname" . }}"]
+    verbs: ["get", "patch"]
+  # Manage the daemon Secret (API-key updates via the console). Scoped by name.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["{{ include "open-design.secretName" . }}"]
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "open-design.console.fullname" . }}
+  labels:
+    {{- include "open-design.console.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "open-design.console.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "open-design.console.fullname" . }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+{{- end }}

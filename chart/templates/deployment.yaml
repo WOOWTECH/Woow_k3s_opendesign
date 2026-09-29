@@ -1,156 +1,330 @@
+{{- if and (not .Values.authProxy.enabled) (has (lower .Values.config.bindHost) (list "127.0.0.1" "localhost" "::1")) }}
+{{- fail "authProxy.enabled=false requires config.bindHost=0.0.0.0 (a loopback-bound daemon with no in-pod proxy is unreachable)" }}
+{{- end }}
+{{- $daemonPort := .Values.service.targetPort -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "opendesign.fullname" . }}
+  name: {{ include "open-design.fullname" . }}
   labels:
-    {{- include "opendesign.labels" . | nindent 4 }}
+    {{- include "open-design.labels" . | nindent 4 }}
 spec:
-  replicas: 1
-  # RWO Longhorn volume: the old pod must detach before the new one attaches.
-  # This, not a nodeSelector, is what handles single-attach on rollout.
+  replicas: {{ .Values.replicaCount }}
+  # TWO RWO PVCs (/app/.od, /home/opendesign) → Recreate, NOT RollingUpdate.
+  # RollingUpdate starts the replacement pod before terminating the old one; both
+  # would contend for the same RWO volumes → "Multi-Attach error" deadlock.
+  # Recreate releases the PVCs first. Safe here: per-instance single-replica.
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      {{- include "opendesign.selectorLabels" . | nindent 6 }}
+      {{- include "open-design.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      annotations:
-        # Rolls the pod when either ConfigMap changes, exactly as the live
-        # pi-agent Deployments do (they carry checksum/nginx).
-        checksum/nginx: {{ include (print $.Template.BasePath "/configmap-nginx.yaml") . | sha256sum }}
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
-        {{- if and .Values.opendesign.extraEnvSecret.enabled .Values.opendesign.extraEnvSecret.create }}
-        # Only rendered when this chart owns the Secret; a Secret managed out of
-        # band is rotated by whoever owns it, and a checksum the chart cannot
-        # see would be a lie.
-        checksum/extra-env: {{ include (print $.Template.BasePath "/extra-env-secret.yaml") . | sha256sum }}
-        {{- end }}
-        {{- with .Values.podAnnotations }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
       labels:
-        {{- include "opendesign.labels" . | nindent 8 }}
+        {{- include "open-design.labels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+      annotations:
+        # Roll the pod when the auth-proxy / daemon ConfigMap changes. subPath mounts
+        # don't hot-update and a ConfigMap edit alone won't roll the Deployment, so
+        # without this an upgrade that only touches the nginx config (e.g. the console
+        # /console route) never reaches the running nginx. gap #49.
+        checksum/authproxy-config: {{ include (print $.Template.BasePath "/auth-proxy-configmap.yaml") . | sha256sum }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
-      # No RBAC objects at all: default ServiceAccount, token not mounted.
-      automountServiceAccountToken: false
-      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      serviceAccountName: {{ include "open-design.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountToken }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.priorityClassName }}
-      priorityClassName: {{ . | quote }}
-      {{- end }}
-      {{- with .Values.nodeSelector }}
-      nodeSelector:
+      {{- with .Values.podSecurityContext }}
+      securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.tolerations }}
-      tolerations:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with .Values.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      containers:
-        - name: opendesign
-          image: {{ include "opendesign.image" . | quote }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $seedHome := .Values.homeSeed.enabled -}}
+      {{- $authInit := and .Values.authProxy.enabled .Values.authProxy.basicAuth.enabled -}}
+      {{- if or $seedHome $authInit }}
+      initContainers:
+      {{- end }}
+      {{- if $seedHome }}
+        # Seed the default dotfiles into the home PVC — fill gaps only, NEVER overwrite.
+        #
+        # WHY: od-home mounts OVER /home/opendesign and SHADOWS the home baked into
+        # the image; the kubelet does NOT replay /etc/skel into a fresh volume, so a
+        # brand-new instance has no ~/.bashrc at all. The console terminal is
+        # `kubectl exec -- /bin/bash` — an interactive NON-login shell, which sources
+        # only /etc/bash.bashrc + ~/.bashrc — so ~/.bashrc is THE per-tenant shell
+        # customisation hook and it must exist. platform#407.
+        #
+        # Runs on EVERY pod start (not first-install-only): a file the tenant deleted
+        # comes back, a file the tenant edited is left strictly alone.
+        - name: seed-home
+          image: {{ include "open-design.homeSeedImage" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          # No containerPort for {{ .Values.opendesign.port }} on purpose: the
-          # daemon binds 127.0.0.1 and is not reachable over the pod network.
-          # Declaring it would advertise a socket that does not exist there.
-          envFrom:
-            - configMapRef:
-                name: {{ include "opendesign.fullname" . }}-config
-            {{- if .Values.opendesign.extraEnvSecret.enabled }}
-            # Opt-in, off by default. Later in the list than the ConfigMap, so
-            # a key present in both would resolve to the Secret -- which the
-            # render-time guard in _helpers.tpl refuses to let happen.
-            - secretRef:
-                name: {{ include "opendesign.extraEnvSecretName" . }}
-                optional: {{ .Values.opendesign.extraEnvSecret.optional }}
-            {{- end }}
+          command:
+            - sh
+            - -c
+            - |
+              # NOTE: deliberately NO `set -e` (and an unconditional exit 0 below) —
+              # a missing dotfile is cosmetic, but a failing initContainer would
+              # CrashLoop the whole instance. Seeding is best-effort by design.
+              SKEL={{ .Values.homeSeed.skelDir | quote }}
+              HOME_DIR={{ .Values.persistence.home.mountPath | quote }}
+              for f in{{ range .Values.homeSeed.files }} {{ . | quote }}{{ end }}; do
+                src="$SKEL/$f"
+                dst="$HOME_DIR/$f"
+                if [ ! -f "$src" ]; then
+                  echo "[seed-home] $src not in image — skip"
+                elif [ -e "$dst" ]; then
+                  echo "[seed-home] $dst exists — tenant-owned, skip (seed-if-absent)"
+                elif cp "$src" "$dst" 2>/dev/null && chmod 644 "$dst" 2>/dev/null; then
+                  echo "[seed-home] seeded $dst"
+                else
+                  echo "[seed-home] WARN: could not seed $dst (home volume not writable by uid $(id -u)?)"
+                fi
+              done
+              exit 0
           securityContext:
-            # PID 1 must chown the root-owned Longhorn mount before dropping
-            # to uid 1001 via su-exec; that is the whole reason for uid 0.
-            runAsUser: 0
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
-              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETUID", "SETGID", "KILL"]
-          volumeMounts:
-            - name: data
-              mountPath: {{ .Values.opendesign.dataDir }}
+            # uid 1001 (opendesign). /home/opendesign is drwxrwsr-x root:opendesign
+            # and fsGroup=1001 makes the mounted volume group-writable, so the copies
+            # land owned by the same user the daemon/ttyd shell runs as.
+            runAsUser: {{ .Values.homeSeed.runAsUser }}
+          # initContainers also need requests+limits (paas-ws-* ns ResourceQuota).
           resources:
-            {{- toYaml .Values.opendesign.resources | nindent 12 }}
-          # No probes here. The daemon is loopback-only, so an httpGet from
-          # the kubelet (which arrives on the pod IP) could never reach it.
-          # The sidecar's probes cover the whole chain instead.
-        - name: nginx
-          image: {{ include "opendesign.nginxImage" . | quote }}
-          imagePullPolicy: {{ .Values.nginx.image.pullPolicy }}
+            {{- toYaml .Values.homeSeed.resources | nindent 12 }}
+          volumeMounts:
+            - name: od-home
+              mountPath: {{ .Values.persistence.home.mountPath }}
+      {{- end }}
+      {{- if $authInit }}
+        # Render the nginx basic-auth htpasswd from the tenant admin_password. Kept
+        # out of the ConfigMap (sensitive) — written to an emptyDir the nginx sidecar
+        # reads. {PLAIN} scheme: admin_password is already in the Secret plaintext
+        # (console gate / ttyd), so this leaks nothing new and avoids bcrypt-salt churn.
+        - name: authproxy-init
+          image: "{{ .Values.authProxy.image.repository }}:{{ .Values.authProxy.image.tag }}"
+          imagePullPolicy: {{ .Values.authProxy.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              # Strip CR/LF so a stray newline in admin_password can't inject a second
+              # htpasswd line (nginx {PLAIN} reads to end-of-line).
+              CLEAN_PW=$(printf '%s' "$ADMIN_PASSWORD" | tr -d '\r\n')
+              printf '%s:{PLAIN}%s\n' "$BASIC_USER" "$CLEAN_PW" > /auth/.htpasswd
+              chmod 644 /auth/.htpasswd
+              echo "[authproxy-init] htpasswd written for user '$BASIC_USER'"
+          env:
+            - name: BASIC_USER
+              value: {{ include "open-design.basicAuthUsername" . | quote }}
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-design.secretName" . }}
+                  key: admin_password
+          resources:
+            {{- toYaml .Values.authProxy.initResources | nindent 12 }}
+          volumeMounts:
+            - name: authproxy-auth
+              mountPath: /auth
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.image.enforceBindHost }}
+          # Override CMD ONLY (keeps the image's tini ENTRYPOINT + zombie reaping) so
+          # config.bindHost is authoritative: the upstream CMD's `--host 0.0.0.0`
+          # (daemon CLI flag > OD_BIND_HOST env) would otherwise ignore bindHost and
+          # listen on the pod IP, defeating the Option C loopback isolation.
+          args:
+            - node
+            - apps/daemon/bin/od.mjs
+            - --host
+            - {{ .Values.config.bindHost | quote }}
+            - --port
+            - {{ $daemonPort | quote }}
+            - --no-open
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: http
-              containerPort: {{ .Values.nginx.port }}
+              containerPort: {{ $daemonPort }}
               protocol: TCP
-          securityContext:
-            runAsUser: 101
-            runAsGroup: 101
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-          volumeMounts:
-            - name: nginx-config
-              mountPath: /etc/nginx/nginx.conf
-              subPath: nginx.conf
-              readOnly: true
-            - name: nginx-config
-              mountPath: /usr/share/nginx/od-export-bridge.js
-              subPath: od-export-bridge.js
-              readOnly: true
-            # readOnlyRootFilesystem: every nginx temp path and the pid file
-            # are redirected to the ROOT of this /tmp emptyDir -- NOT a
-            # subdirectory. nginx never creates a pid file's parent dir, so a
-            # nested layout crash-loops; see the header of chart/files/nginx.conf.
-            - name: tmp
-              mountPath: /tmp
-          # /api/health is exempted from OpenDesign's origin middleware for
-          # monitoring probes, and a 200 proves nginx -> 127.0.0.1:{{ .Values.opendesign.port }} -> daemon.
+          # Non-sensitive daemon env (OD_ALLOWED_ORIGINS / OD_PORT / OD_BIND_HOST).
+          envFrom:
+            - configMapRef:
+                name: {{ include "open-design.configMapName" . }}
+          env:
+            # INTERNAL token (optional:true — with loopback bind the daemon exempts
+            # nginx anyway; present for defense-in-depth / a 0.0.0.0 override).
+            - name: OD_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-design.secretName" . }}
+                  key: OD_API_TOKEN
+                  optional: true
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-design.secretName" . }}
+                  key: ANTHROPIC_API_KEY
+                  optional: true
+            # Server-side OpenRouter key for the in-container OpenCode runtime
+            # (BYOK keys typed in the web UI stay in the browser and never
+            # reach here). Optional: absent key → env unset.
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-design.secretName" . }}
+                  key: OPENROUTER_API_KEY
+                  optional: true
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.authProxy.enabled }}
+          # Daemon binds loopback → the kubelet cannot httpGet it. A startupProbe
+          # guards the slow cold boot (heavy 2Gi image) so liveness can't kill it
+          # mid-init; liveness then restarts only a HUNG daemon. Pod READINESS is
+          # governed by the nginx sidecar (green once it can proxy /api/health).
           startupProbe:
-            httpGet:
-              path: /api/health
-              port: http
-            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
-            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
-            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            exec:
+              command:
+                - sh
+                - -c
+                - curl -sf http://127.0.0.1:{{ $daemonPort }}/api/health || exit 1
+            periodSeconds: 10
+            failureThreshold: 30
+            timeoutSeconds: 5
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - curl -sf http://127.0.0.1:{{ $daemonPort }}/api/health || exit 1
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- else }}
+          # authProxy disabled → daemon bound 0.0.0.0, probed directly by the kubelet.
+          {{- with .Values.readinessProbe }}
           readinessProbe:
             httpGet:
               path: /api/health
               port: http
-            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
-            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
-            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
           livenessProbe:
             httpGet:
               path: /api/health
               port: http
-            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
-            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
-            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- end }}
           resources:
-            {{- toYaml .Values.nginx.resources | nindent 12 }}
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: od-data
+              mountPath: {{ .Values.persistence.data.mountPath }}
+            - name: od-home
+              mountPath: {{ .Values.persistence.home.mountPath }}
+        {{- if .Values.authProxy.enabled }}
+        - name: authproxy
+          image: "{{ .Values.authProxy.image.repository }}:{{ .Values.authProxy.image.tag }}"
+          imagePullPolicy: {{ .Values.authProxy.image.pullPolicy }}
+          ports:
+            - name: proxy
+              containerPort: {{ .Values.authProxy.port }}
+              protocol: TCP
+          # READINESS proxies /api/health (basic-auth-exempt) to the daemon — the pod
+          # is Ready only when nginx is up AND the daemon answers over loopback.
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: proxy
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # LIVENESS hits an nginx-LOCAL stub (return 200) — never the daemon — so a
+          # daemon outage restarts the DAEMON (its own exec liveness), NOT this healthy
+          # sidecar. Coupling nginx liveness to /api/health would restart the wrong
+          # container and CrashLoop nginx during a daemon outage / slow cold boot.
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: proxy
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.authProxy.resources | nindent 12 }}
+          volumeMounts:
+            # subPath (not a bare conf.d dir mount) so the main nginx.conf — which
+            # pins worker_processes (see auth-proxy-configmap) — lands at
+            # /etc/nginx/nginx.conf while the server block stays in conf.d/.
+            - name: authproxy-conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: authproxy-conf
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+              readOnly: true
+            {{- if .Values.authProxy.basicAuth.enabled }}
+            - name: authproxy-auth
+              mountPath: /etc/nginx/auth
+              readOnly: true
+            {{- end }}
+        {{- end }}
       volumes:
-        - name: data
+        {{- if .Values.persistence.data.enabled }}
+        - name: od-data
           persistentVolumeClaim:
-            claimName: {{ include "opendesign.fullname" . }}-data
-        - name: nginx-config
-          configMap:
-            name: {{ include "opendesign.fullname" . }}-nginx
-        - name: tmp
+            claimName: {{ include "open-design.dataPvcName" . }}
+        {{- else }}
+        # NON-persistent fallback — /app/.od is lost on pod restart.
+        - name: od-data
           emptyDir: {}
+        {{- end }}
+        {{- if .Values.persistence.home.enabled }}
+        - name: od-home
+          persistentVolumeClaim:
+            claimName: {{ include "open-design.homePvcName" . }}
+        {{- else }}
+        # NON-persistent fallback — the claude.ai login session is lost on restart.
+        - name: od-home
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.authProxy.enabled }}
+        - name: authproxy-conf
+          configMap:
+            name: {{ include "open-design.authProxyConfigMapName" . }}
+        {{- if .Values.authProxy.basicAuth.enabled }}
+        - name: authproxy-auth
+          emptyDir: {}
+        {{- end }}
+        {{- end }}

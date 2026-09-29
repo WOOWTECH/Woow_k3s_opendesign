@@ -1,27 +1,46 @@
 apiVersion: v2
-name: opendesign
-description: >-
-  Woow OpenDesign on woow-k3s: the OpenDesign daemon (loopback-bound) plus a
-  filter-free nginx sidecar, installed into the EXISTING pi-agent-woow
-  namespace and published exclusively through the shared Nginx Proxy Manager
-  container, which is the sole authentication boundary.
+name: open-design
+description: |
+  OpenDesign cloud service chart (daemon + console).
+
+  A per-instance service running the OpenDesign daemon (nexu-io/open-design):
+  the daemon HTTP API on port 7457, state persisted on TWO independent RWO PVCs
+  (od-data at /app/.od, od-home at /home/opendesign — the latter keeps the
+  claude.ai login session / agent CLI config). Deployed per-tenant by
+  paas-operator into a paas-ws-* namespace; reached via the platform subdomain +
+  Cloudflare tunnel (ClusterIP by default) or an optional in-chart Ingress.
+
+  Ships an optional console (console.enabled, default true): a web dashboard
+  (Flask :18790) + web terminal (ttyd :7681) that kubectl-execs into the daemon
+  pod via a scoped ServiceAccount/RBAC.
+
+  AUTH: unlike the upstream compose (which disables daemon API auth behind a
+  private Cloudflare Tunnel), this chart does NOT set OD_DISABLE_API_AUTH — the
+  platform tenant URL is public, so OD_API_TOKEN is required and injected by the
+  platform (or self-generated + persisted by the chart).
 type: application
-
-# One number for the chart and the image tag. `image.tag` defaults to this.
-version: 2.0.1
-# The upstream OpenDesign version baked into the image (ghcr.io/nexu-io/od).
-appVersion: "0.21.1"
-
-kubeVersion: ">=1.24.0-0"
-
+# 0.1.0 = initial OpenDesign chart (daemon + console), modelled on the
+# mcp-server / home-assistant per-instance single-app skeletons (Recreate + RWO
+# PVC + ClusterIP + operator-baseline NetworkPolicy), extended with a second PVC
+# and an optional console sidecar deployment.
+# 0.2.0 = OpenDesign 0.24.1 image (upstream prebuilt base + Claude Code/OpenCode);
+# authProxy.basicAuth.username becomes tenant-changeable and is validated at
+# render; optional auth.openrouterApiKey → OPENROUTER_API_KEY. The daemon
+# command (apps/daemon/bin/od.mjs) is unchanged — upstream still ships it.
+version: 0.2.0
+# appVersion tracks the upstream OpenDesign release (nexu-io/open-design).
+# The platform pins the real image tag@digest via helm_default_values.
+appVersion: "0.24.1"
 keywords:
+  - paas
   - open-design
   - opendesign
-  - k3s
-  - woowtech
-home: https://github.com/WOOWTECH/Woow_k3s_opendesign
-sources:
-  - https://github.com/WOOWTECH/Woow_k3s_opendesign
+  - design
+  - cloud-service
 maintainers:
-  - name: WoowTech
-    url: https://github.com/WOOWTECH
+  - name: WOOW PaaS Team
+home: https://git-prod.woowtech.io/woow-paas/woow-paas-charts
+sources:
+  - https://git-prod.woowtech.io/woow-paas/woow-paas-charts
+  - https://github.com/WOOWTECH/Woow_opendesign_docker_compose_all
+  - https://github.com/nexu-io/open-design
