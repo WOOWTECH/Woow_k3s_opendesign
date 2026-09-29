@@ -1,0 +1,82 @@
+name: Mirror CI (validate only)
+
+# This repository mirrors the WOOW PaaS open-design sources from the internal
+# Gitea (see MIRROR.md). CI only proves the mirrored files are internally
+# consistent: the chart lints and passes its own tests, and both images build.
+# Nothing is pushed — production images and charts are published from Gitea
+# to the private registry, behind that repo's prod approval gate.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HELM_VERSION: 3.19.5
+  HELM_SHA256: a0a5e8c592ed3f376ac110715eff214730c7422f9a44d96cf98117d2b8b0e6c0
+  YQ_VERSION: 4.44.6
+  YQ_SHA256: 0c2b24e645b57d8e7c0566d18643a6d4f5580feeea3878127354a46f2a1e4598
+
+jobs:
+  chart:
+    name: Chart lint + tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned helm and yq
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -fsSL -o helm.tgz "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  helm.tgz" | sha256sum --check --strict
+          tar -xzf helm.tgz linux-amd64/helm
+          sudo install -m 0755 linux-amd64/helm /usr/local/bin/helm
+          curl -fsSL -o yq "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  yq" | sha256sum --check --strict
+          sudo install -m 0755 yq /usr/local/bin/yq
+
+      - name: helm lint
+        run: helm lint chart
+
+      - name: Chart tests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for t in chart/tests/*.sh; do
+            echo "::group::$t"
+            bash "$t"
+            echo "::endgroup::"
+          done
+
+  image:
+    name: Build ${{ matrix.name }} image (no push)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: daemon
+            context: image
+          - name: console
+            context: console
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      # The daemon Dockerfile ends with a build-time contract (exact Claude Code
+      # and OpenCode versions, every tool on PATH), so a successful build is
+      # itself the check.
+      - uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          push: false
+          tags: woow-open-design-${{ matrix.name }}:ci

@@ -1,117 +1,75 @@
-{{- $fullname := include "opendesign.fullname" . -}}
-{{- $public := include "opendesign.publicUrl" . -}}
-Woow OpenDesign {{ .Chart.AppVersion }} (chart {{ .Chart.Version }}) installed as
-release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
-{{ if eq $public "https://opendesign.example.com" }}
-=======================================================================
-WARNING: publicUrl is still the chart's example origin
-         ({{ $public }}).
-         That is not your hostname. OD_ALLOWED_ORIGINS and
-         OD_PUBLIC_BASE_URL now name a domain no browser will ever
-         present, so OpenDesign will reject every cross-site request
-         from your real hostname and the UI will not work.
-         Set publicUrl to the https:// origin NPM publishes and
-         `helm upgrade`.
-=======================================================================
-{{ end -}}
+{{ .Chart.Name }} deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}" (OpenDesign {{ .Chart.AppVersion }}).
 
-Nothing is publicly reachable yet. The chart deliberately owns no ingress: the
-only path in is the shared Nginx Proxy Manager container, which is also the
-only thing that authenticates. Two steps remain, and NEITHER is chart-owned.
+Daemon Service ({{ .Values.service.type }}){{ if .Values.authProxy.enabled }} → in-pod auth-proxy :{{ .Values.authProxy.port }} → loopback daemon{{ end }}:
 
-1) cloudflared -- add the hostname to the pi-tunnel release, via Helm:
+    {{ include "open-design.serviceName" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
 
-     helm -n {{ .Release.Namespace }} upgrade pi-tunnel <chart> \
-       --reuse-values --set 'ingress[N].hostname={{ trimPrefix "https://" $public }}' \
-       --set 'ingress[N].service=http://npm.{{ .Release.Namespace }}.svc.cluster.local:80'
-
-   NEVER `kubectl patch` the pi-tunnel-cloudflared ConfigMap. That ConfigMap
-   once carried 10 hand-appended hostnames while Helm knew about 2, and a
-   plain `helm upgrade` would have 404'd four public hostnames.
-
-2) Nginx Proxy Manager UI (https://pi-agent-npm.woowtech.io) -> Proxy Hosts ->
-   Add Proxy Host:
-
-     Domain Names      : {{ trimPrefix "https://" $public }}
-     Scheme            : http
-     Forward Hostname  : {{ $fullname }}.{{ .Release.Namespace }}.svc.cluster.local
-     Forward Port      : {{ .Values.service.port }}
-     Websockets Support: ON      <-- required, OpenDesign streams over WS
-     Block Common Exploits: ON
-     Access List       : the same basic-auth list the pi-agent hosts use
-     SSL               : request/attach a cert as the sibling hosts do
-
-   Nothing in the npm Deployment, Service or NetworkPolicy needs to change.
-
-Check it came up:
-
-  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ $fullname }}
-  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fullname }} 7457:{{ .Values.service.port }}
-  curl -s localhost:7457/api/health     # expect {"ok":true}
-{{ if .Values.helmTest.enabled }}
-  helm -n {{ .Release.Namespace }} test {{ .Release.Name }}
-{{- if and .Values.networkPolicy.enabled (not .Values.networkPolicy.allowHelmTest) }}
-  # ^ will TIME OUT as configured: the NetworkPolicy admits only
-  #   {{ keys .Values.networkPolicy.fromPodLabels | join "," }}-labelled pods and the listed CIDRs.
-  #   Re-run after `helm upgrade --set networkPolicy.allowHelmTest=true`,
-  #   which rewrites that one policy and rolls nothing.
-{{- end }}
-  # Read-only: two GETs through the Service, no PVC mounted, nothing written.
+  → mcp-opendesign od_api_base: http://{{ include "open-design.serviceName" . }}:{{ .Values.service.port }}
+{{- if and .Values.authProxy.enabled .Values.authProxy.basicAuth.enabled }}
+    ⚠ /api/* is behind HTTP basic-auth — in-cluster callers (mcp-opendesign) must
+      send Authorization: Basic (user "{{ .Values.authProxy.basicAuth.username }}" / admin_password). See #375.
 {{- end }}
 
-Uninstall keeps your data:
-{{ if .Values.keepOnUninstall }}
-  `helm uninstall {{ .Release.Name }}` leaves PVC {{ $fullname }}-data
-  {{- if .Values.backup.enabled }}, PVC {{ $fullname }}-backup{{ end }} and the
-  namespace in place (helm.sh/resource-policy: keep). Deleting the data is a
-  separate, deliberate `kubectl delete pvc`.
+{{- if .Values.ingress.enabled }}
+Ingress: https://{{ .Values.ingress.host }}{{ .Values.ingress.path }}
 {{- else }}
-  WARNING: keepOnUninstall is FALSE. `helm uninstall {{ .Release.Name }}` will
-  DELETE PVC {{ $fullname }}-data and every design in it.
+External access: platform subdomain + Cloudflare tunnel → this ClusterIP:{{ .Values.service.port }}
+(no in-chart Ingress; set ingress.enabled=true for a real K8s Ingress).
 {{- end }}
 
-Security posture, so nobody "fixes" it later:
-  * The daemon binds 127.0.0.1:{{ .Values.opendesign.port }} and is unreachable over the pod
-    network. OD_API_TOKEN and OD_DISABLE_API_AUTH are both ABSENT, and that is
-    correct -- unreachable-by-construction beats any token.
-  * OD_ALLOWED_ORIGINS is {{ $public }}. A cross-site request with any other
-    Origin is rejected by the daemon.
-{{- if .Values.nginx.requireOriginOnMutation }}
-  * The sidecar returns 403 for any non-GET/HEAD/OPTIONS request with no
-    Origin header. Flip nginx.requireOriginOnMutation to false only for
-    non-browser automation, and record why.
+Persistence (two independent RWO PVCs):
+{{- if .Values.persistence.data.enabled }}
+    {{ include "open-design.dataPvcName" . }} ({{ .Values.persistence.data.size }}) → {{ .Values.persistence.data.mountPath }}
 {{- else }}
-  * WARNING: nginx.requireOriginOnMutation is FALSE. Mutating requests with no
-    Origin header reach the daemon and are accepted via its loopback-Host
-    branch. You are relying on the NPM Access List alone.
+    data: emptyDir (NON-persistent — {{ .Values.persistence.data.mountPath }} lost on restart)
 {{- end }}
-  * BYOK keys are entered in the browser and stay browser-local: they never
-    reach a ConfigMap, a Secret, an env var or the data volume.
-{{- if .Values.opendesign.extraEnvSecret.enabled }}
-  * Extra environment comes from Secret {{ include "opendesign.extraEnvSecretName" . }},
-    {{ if .Values.opendesign.extraEnvSecret.create }}rendered by this chart{{ else }}created out of band -- this chart only references it{{ end }}.
-    Those values are NOT in ConfigMap {{ $fullname }}-config.
+{{- if .Values.persistence.home.enabled }}
+    {{ include "open-design.homePvcName" . }} ({{ .Values.persistence.home.size }}) → {{ .Values.persistence.home.mountPath }} (keeps the claude.ai login session)
+{{- else }}
+    home: emptyDir (NON-persistent — the claude.ai login session is lost on restart)
 {{- end }}
-{{- if .Values.opendesign.extraEnv }}
-  * WARNING: opendesign.extraEnv is set, and it is rendered into ConfigMap
-    {{ $fullname }}-config in CLEARTEXT. Keys: {{ keys .Values.opendesign.extraEnv | sortAlpha | join ", " }}.
-    Anything with `get configmaps` in this namespace can read those values, and
-    `helm get values` echoes them back. If any of them is a credential, move it
-    to opendesign.extraEnvSecret.
+{{- if not .Values.persistence.data.storageClass }}
+    storageClass not set → cluster default (platform injects persistence.<vol>.storageClass, default longhorn-delete).
 {{- end }}
 
-{{ if .Values.backup.enabled -}}
-Backup: CronJob {{ $fullname }}-backup runs "{{ .Values.backup.schedule }}", keeping {{ .Values.backup.retain }}
-archives on PVC {{ $fullname }}-backup. Restore:
-
-  kubectl -n {{ .Release.Namespace }} scale deploy/{{ $fullname }} --replicas=0
-  # run a throwaway pod mounting both PVCs, then:
-  #   tar xzf /backup/opendesign-<ts>.tar.gz -C /data
-  kubectl -n {{ .Release.Namespace }} scale deploy/{{ $fullname }} --replicas=1
-
-This copy lives in the same Longhorn cluster: it survives a bad
-`helm uninstall` or an accidental PVC delete, NOT loss of the cluster.
-{{- else -}}
-WARNING: backup.enabled is false and this cluster's Longhorn backup target
-reports available: false. Nothing is backing up PVC {{ $fullname }}-data.
+Auth (Option C — tenant gate = HTTP basic-auth via the auth-proxy):
+{{- if and .Values.authProxy.enabled .Values.authProxy.basicAuth.enabled }}
+    Tenant logs in at the platform URL with basic-auth: user "{{ .Values.authProxy.basicAuth.username }}", password = admin_password.
+{{- if .Values.auth.existingSecret }}
+    admin_password sourced from existing Secret "{{ .Values.auth.existingSecret }}".
+{{- else }}
+    admin_password {{ if .Values.config.sensitive.admin_password }}pinned via values (platform #357){{ else }}self-generated + persisted in Secret {{ include "open-design.secretName" . }}{{ end }}.
+    Read it with:
+      kubectl -n {{ .Release.Namespace }} get secret {{ include "open-design.secretName" . }} -o jsonpath='{.data.admin_password}' | base64 -d
 {{- end }}
+    (OD_API_TOKEN is an INTERNAL daemon secret — the tenant never uses it.)
+{{- else }}
+    ⚠ auth-proxy basic-auth is OFF — the daemon UI/API is exposed WITHOUT a tenant
+      gate. Only safe behind an external auth layer (tunnel SSO / Cloudflare Access).
+{{- end }}
+{{- if not .Values.auth.anthropicApiKey }}
+    ANTHROPIC_API_KEY not set → `claude login` interactively via the console TUI (persisted on the od-home PVC).
+{{- end }}
+
+{{- if .Values.console.enabled }}
+
+Console (dashboard + web terminal):
+    {{ include "open-design.console.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local  (dashboard :{{ .Values.console.service.dashboardPort }}, ttyd :{{ .Values.console.service.ttydPort }})
+{{- if .Values.console.runtimeInstall }}
+    ⚠ runtimeInstall=true — the console downloads ttyd/kubectl/flask at EVERY start
+      (github.com / dl.k8s.io / pypi). Under tenant NetworkPolicy egress limits this
+      can FAIL. RECOMMENDED: bake a console image (Dockerfile.console) and set
+      console.runtimeInstall=false + console.image.* .
+{{- else }}
+    baked mode — console.image={{ .Values.console.image.repository }}:{{ .Values.console.image.tag }}
+      (ttyd + kubectl + python + flask preinstalled; app injected from ConfigMap; no downloads).
+{{- end }}
+    Gated by the SAME credential (同一閘): ttyd + Flask dashboard basic-auth = user "{{ .Values.authProxy.basicAuth.username }}" / admin_password.
+{{- else }}
+
+Console: disabled (console.enabled=false) — daemon only.
+{{- end }}
+
+NOTE: PVC reclaim depends on this release living in a paas-ws-* namespace and
+operator teardown labelling the PVCs paas.woowtech.io/orphaned-at — otherwise the
+pvc-cleanup CronJob will NOT reclaim them.

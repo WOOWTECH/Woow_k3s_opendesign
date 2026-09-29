@@ -1,0 +1,46 @@
+# Open Design Console image — bakes the tools the console needs (ttyd, kubectl,
+# python, flask/requests) so the runtime container does NO network downloads.
+#
+# The console app code (app.py / entrypoint.py / connect.sh / index.html) is NOT
+# baked here — the chart injects it from a ConfigMap at startup, so app changes
+# ship without rebuilding this image. This image is therefore stable and rarely
+# rebuilt (only when a tool version bumps).
+#
+# BUILD (paas-ci / 支線 B), amd64 to match the platform:
+#   docker build --platform linux/amd64 -f Dockerfile.console \
+#     -t jcr-prod.woowtech.io/woow-paas-docker-local/open-design-console:latest .
+#   docker push jcr-prod.woowtech.io/woow-paas-docker-local/open-design-console:latest
+#
+# The chart's values default console.image to this coordinate.
+FROM python:3.9-slim
+
+ARG TTYD_VERSION=1.7.7
+ARG KUBECTL_VERSION=""
+ARG TARGETARCH=amd64
+
+# ttyd static binary (amd64) + kubectl + minimal runtime deps.
+RUN set -eux; \
+    apt-get update -qq; \
+    apt-get install -y -qq --no-install-recommends curl ca-certificates bash; \
+    # ttyd (web terminal)
+    curl -sLo /usr/local/bin/ttyd \
+      "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.x86_64"; \
+    chmod +x /usr/local/bin/ttyd; \
+    # kubectl (pin, or fall back to stable channel at build time)
+    if [ -z "${KUBECTL_VERSION}" ]; then KUBECTL_VERSION="$(curl -sL https://dl.k8s.io/release/stable.txt)"; fi; \
+    curl -sLo /usr/local/bin/kubectl \
+      "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl"; \
+    chmod +x /usr/local/bin/kubectl; \
+    # python deps for the Flask dashboard
+    pip install --no-cache-dir flask==3.1.0 requests==2.32.3; \
+    # cleanup
+    apt-get purge -y --auto-remove; \
+    rm -rf /var/lib/apt/lists/*
+
+# The chart mounts app code at /mnt/scripts + /mnt/html and copies it into /app at
+# startup, then runs: python /app/entrypoint.py (ttyd :7681 + Flask :18790).
+WORKDIR /app
+
+# Sanity: fail the build if a required tool is missing.
+RUN ttyd --version && kubectl version --client=true --output=yaml >/dev/null 2>&1 || kubectl version --client=true; \
+    python -c "import flask, requests"

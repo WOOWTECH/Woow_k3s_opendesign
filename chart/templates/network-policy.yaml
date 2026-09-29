@@ -1,0 +1,185 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- /* External ingress lands on the auth-proxy (8080) when enabled, else the
+       daemon port directly. */ -}}
+{{- $daemonIngressPort := ternary (int .Values.authProxy.port) (int .Values.service.targetPort) .Values.authProxy.enabled -}}
+# default-deny (Ingress+Egress) + explicit converged allow (np-audit #42). Egress is
+# NEVER an open `- {}` — internet goes through an ipBlock excluding cluster CIDR +
+# metadata (F-1/2/3). Covers BOTH daemon + console pods (shared per-release instance
+# label) with default-deny; each gets its own scoped allow below.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "open-design.fullname" . }}-default-deny
+  labels:
+    {{- include "open-design.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "open-design.fullname" . }}-allow
+  labels:
+    {{- include "open-design.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "open-design.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow the daemon proxy port only from the listed namespaces (tunnel /
+    # ingress-controller). EMPTY (default) → NO ingress allow rule; CS-ns ingress is
+    # governed by the operator baseline NetworkPolicy (#279/#280).
+    {{- with .Values.networkPolicy.ingressNamespaces }}
+    - ports:
+        - protocol: TCP
+          port: {{ $daemonIngressPort }}
+      from:
+        {{- range . }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
+    {{- end }}
+  egress:
+    # (1) DNS resolution.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          {{- if .Values.networkPolicy.dnsKubeDnsOnly }}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+          {{- end }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if and .Values.console.enabled .Values.console.externalPath }}
+    # auth-proxy (this pod) → console ttyd, so the external /console route can proxy
+    # to the web terminal (gap #49). In-cluster hole: the console ClusterIP is inside
+    # the excluded Service CIDR, so it needs an explicit pod-scoped allow.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "open-design.console.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ int .Values.console.service.ttydPort }}
+    {{- end }}
+    {{- if .Values.networkPolicy.allowAllEgress }}
+    # (2) daemon → the internet (Anthropic API, agent CLIs). ipBlock EXCLUDES cluster
+    # Pod/Service CIDR + RFC1918 + cloud metadata + CGNAT + loopback → the AI-agent
+    # pod cannot reach in-cluster control-plane ClusterIPs or SSRF node metadata.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- range .Values.networkPolicy.egressExcludeCidrs }}
+              - {{ . }}
+              {{- end }}
+      ports:
+        {{- range .Values.networkPolicy.externalPorts }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+{{- if .Values.console.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "open-design.console.fullname" . }}-allow
+  labels:
+    {{- include "open-design.console.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "open-design.console.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    {{- with .Values.networkPolicy.ingressNamespaces }}
+    - ports:
+        - protocol: TCP
+          port: {{ $.Values.console.service.dashboardPort }}
+        - protocol: TCP
+          port: {{ $.Values.console.service.ttydPort }}
+      from:
+        {{- range . }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
+    {{- end }}
+    {{- if $.Values.console.externalPath }}
+    # auth-proxy (daemon pod) → console ttyd for the external /console route (gap #49).
+    - ports:
+        - protocol: TCP
+          port: {{ $.Values.console.service.ttydPort }}
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "open-design.selectorLabels" $ | nindent 14 }}
+    {{- end }}
+  egress:
+    # (1) DNS resolution.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          {{- if .Values.networkPolicy.dnsKubeDnsOnly }}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+          {{- end }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # (2) console → kube-apiserver (kubectl get/exec/logs/rollout). EXPLICIT
+    # allowlist — the apiserver ClusterIP is in the excluded Service CIDR, so it
+    # needs its own hole (never allow-all).
+    {{- with .Values.networkPolicy.apiServerCidrs }}
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        {{- range $.Values.networkPolicy.apiServerPorts }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+    {{- if and .Values.networkPolicy.allowAllEgress .Values.console.runtimeInstall }}
+    # (3) console runtimeInstall bootstrap → github.com / dl.k8s.io / pypi. Same safe
+    # ipBlock (cluster + metadata excluded). Absent in baked mode (no downloads).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- range .Values.networkPolicy.egressExcludeCidrs }}
+              - {{ . }}
+              {{- end }}
+      ports:
+        {{- range .Values.networkPolicy.externalPorts }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   check-pollution:
-    name: Check for cross-repo pollution and removed components
+    name: Check for cross-repo pollution and mirror completeness
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -30,7 +30,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Scan for pollution and re-added removed components
+      - name: Scan for pollution and verify the mirror
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -57,31 +57,19 @@ jobs:
             found=1
           fi
 
-          # Components deleted in 2.0.0. Re-adding any of them is a design
-          # regression, not a merge accident. See CHANGELOG.md 2.0.0.
-          for path in \
-            console \
-            od-mcp \
-            Dockerfile.open-design \
-            headless-renderer.py \
-            chart/templates/namespace.yaml \
-            chart/templates/secret.yaml \
-            runtime/pi \
-            rootfs/usr/local/bin/pi \
-          ; do
-            if [ -e "$path" ]; then
-              echo "REMOVED COMPONENT: '$path' was deleted in 2.0.0 and must not return"
+          # 3.0.0: this repository became a mirror of the WOOW PaaS open-design
+          # sources (see MIRROR.md). The PaaS version deliberately ships a
+          # console (ttyd + dashboard) and a chart-managed Secret, so the 2.0.0
+          # "removed components" list no longer applies; the single-instance
+          # design it protected is preserved on legacy/k3s-single-instance.
+          # The mirrored directories must exist, and nothing else may appear
+          # at the top level next to them.
+          for path in image/Dockerfile console/Dockerfile chart/Chart.yaml MIRROR.md; do
+            if [ ! -e "$path" ]; then
+              echo "MIRROR INCOMPLETE: '$path' is missing (run scripts/sync-from-gitea.sh)"
               found=1
             fi
           done
-
-          removed_templates=$(find chart/templates -maxdepth 1 \
-            \( -name 'console-*' -o -name 'mcp-*' -o -name '*ttyd*' \) 2>/dev/null || true)
-          if [ -n "$removed_templates" ]; then
-            echo "REMOVED COMPONENT: console/mcp/ttyd templates must not return:"
-            echo "$removed_templates" | sed 's/^/    /'
-            found=1
-          fi
 
           if [ "$found" -eq 1 ]; then
             echo "Repo guard failed. Push blocked."

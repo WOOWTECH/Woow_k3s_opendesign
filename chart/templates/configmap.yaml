@@ -1,30 +1,32 @@
-{{- include "opendesign.validateExtraEnv" . -}}
-{{- $public := include "opendesign.publicUrl" . -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "opendesign.fullname" . }}-config
+  name: {{ include "open-design.configMapName" . }}
   labels:
-    {{- include "opendesign.labels" . | nindent 4 }}
+    {{- include "open-design.labels" . | nindent 4 }}
 data:
-  # Loopback bind. server.js:1740 refuses to start on a non-loopback host
-  # unless OD_API_TOKEN is set or OD_DISABLE_API_AUTH=1; loopback is the only
-  # bind that needs neither, and it makes the daemon socket unreachable over
-  # the pod network entirely. Nginx Proxy Manager is the auth boundary.
-  # OD_API_TOKEN and OD_DISABLE_API_AUTH are deliberately ABSENT.
-  OD_BIND_HOST: "127.0.0.1"
-  OD_PORT: {{ .Values.opendesign.port | quote }}
-  OD_DATA_DIR: {{ .Values.opendesign.dataDir | quote }}
-  # The reverse-proxy escape hatch in origin-validation.js: a browser request
-  # carrying exactly this Origin is trusted; anything else falls through to
-  # isAllowedBrowserOrigin and is rejected. Never "*", never empty.
-  OD_ALLOWED_ORIGINS: {{ $public | quote }}
-  # Without this the MCP OAuth redirect_uri is registered as http:// from
-  # internal request headers while the browser redirects over https://,
-  # which the auth provider answers with invalid_request.
-  OD_PUBLIC_BASE_URL: {{ $public | quote }}
-  NODE_ENV: "production"
-  TZ: {{ .Values.opendesign.timezone | quote }}
-{{- range $k, $v := .Values.opendesign.extraEnv }}
+  # Non-sensitive daemon env (upstream 02-config.yaml), consumed via envFrom.
+  # OD_DISABLE_API_AUTH is intentionally ABSENT — daemon API auth stays ON behind
+  # the public tenant URL (OD_API_TOKEN is injected via the Secret).
+  #
+  # OD_ALLOWED_ORIGINS: the daemon parses each entry with `new URL()` and CRASHES on
+  # a bare "*" (ERR_INVALID_URL — it wants full origin URLs, not a wildcard). It is
+  # NOT a CORS allow-all either: isAllowedBrowserOrigin() only trusts a browser Origin
+  # that is same-origin AND loopback/private-LAN, OR listed here VERBATIM. A public
+  # tenant URL is neither, so the platform MUST pass
+  #   config.allowedOrigins = "https://<tenant-host>"
+  # for the browser UI/API to work. "*" (and empty) are treated as unset here → the
+  # key is omitted → daemon boots (configuredAllowedOrigins() returns [] on unset)
+  # but public-origin browser requests get 403 until a real origin is supplied.
+  {{- $allowedOrigins := .Values.config.allowedOrigins }}
+  {{- if eq $allowedOrigins "*" }}
+  {{- $allowedOrigins = "" }}
+  {{- end }}
+  {{- if $allowedOrigins }}
+  OD_ALLOWED_ORIGINS: {{ $allowedOrigins | quote }}
+  {{- end }}
+  OD_PORT: {{ .Values.service.targetPort | quote }}
+  OD_BIND_HOST: {{ .Values.config.bindHost | quote }}
+  {{- range $k, $v := .Values.config.extraConfig }}
   {{ $k }}: {{ $v | quote }}
-{{- end }}
+  {{- end }}

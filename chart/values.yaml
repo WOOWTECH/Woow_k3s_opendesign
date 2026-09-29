@@ -1,304 +1,417 @@
-# Woow OpenDesign on woow-k3s.
+# Default values for open-design.
 #
-# Installed into an EXISTING namespace (Rancher owns namespace creation here):
-#   helm -n pi-agent-woow install opendesign . -f my-values.yaml
-#
-# This chart creates NO namespace, NO Secret, NO ServiceAccount and NO RBAC.
-# It holds no credential of any kind: OpenDesign's BYOK keys are entered in the
-# browser and stay browser-local, the daemon binds to loopback so it needs no
-# API token, and authentication is done by the shared Nginx Proxy Manager
-# container (deployment/npm in this namespace), never by this chart.
+# Release-name convention (paas-operator): svc-{reference_id[:8]}, installed into
+# a paas-ws-* namespace. The platform CloudAppTemplate pins this chart via OCI
+# and aligns image.* / persistence.* / service.* / auth.* / console.* through
+# helm_default_values.
 
-nameOverride: ""
-fullnameOverride: ""
-
-# ── Data retention ─────────────────────────────────────────────────────────
-# true adds `helm.sh/resource-policy: keep` to every object that holds state:
-# both PVCs, and the extra-env Secret when this chart creates it.
-# `helm uninstall` then leaves the data behind -- the only reason the previous
-# deployment's ~204 MiB of tenant data survived at all. The chart renders no
-# Namespace (pi-agent-woow is Rancher-managed and shared), so there is nothing
-# namespace-shaped to keep.
-#
-# Set it false ONLY for a throwaway test release whose volumes should go with
-# it, and expect `helm uninstall` to take the data with them.
-keepOnUninstall: true
-
-# ── Required ───────────────────────────────────────────────────────────────
-# The public origin this instance is reached on THROUGH Nginx Proxy Manager,
-# e.g. https://od-woow-k3s.woowtech.io
-#
-# Drives OD_ALLOWED_ORIGINS and OD_PUBLIC_BASE_URL. EVERY install must set it.
-#
-# The value below is an example domain, never a real one, and it is chosen so
-# that the shipped defaults render and validate: `helm template ./chart`,
-# `helm lint`, kubeconform and chart-testing all exercise the default path.
-# Leaving it in place fails CLOSED rather than open -- OD_ALLOWED_ORIGINS is
-# then an origin no browser can ever present, so OpenDesign rejects every
-# cross-site request instead of trusting them all, which is what an EMPTY
-# value used to do.
-#
-# The guards are still hard render failures:
-#   * an empty string                              -> "publicUrl is required"
-#   * anything but an https:// origin with no path -> "publicUrl must be ..."
-# and NOTES.txt prints a loud warning while this example value is still in
-# effect. Unlike the old chart's `__K3S_NODE_HOSTNAME__`, nothing unusable can
-# reach the API server.
-publicUrl: "https://opendesign.example.com"
-
-# ── OpenDesign image ───────────────────────────────────────────────────────
+# ── Daemon image (platform helm_default_values aligns image.*) ────────────────
+# Built by paas-odoo-ci (open-design/Dockerfile) on top of the upstream
+# prebuilt ghcr.io/nexu-io/od image (0.24.1, Alpine), adding Claude Code +
+# OpenCode, and pushed to jcr-prod.woowtech.io/woow-paas-docker-local/open-design
+# (amd64). The daemon listens on 7457 and serves GET /api/health. Chart does NOT bind a digest — the
+# platform pins image.tag (or a digest) in helm_default_values at provision.
 image:
-  repository: ghcr.io/woowtech/woow-k3s-opendesign
-  # Blank = use .Chart.Version (2.0.1). The literal "latest" is rejected.
+  repository: jcr-prod.woowtech.io/woow-paas-docker-local/open-design
+  # Empty tag → falls back to Chart.appVersion (sibling convention; avoids the
+  # mutable-":latest" + IfNotPresent no-repull footgun on direct/local installs).
+  # paas-ci pushes a build tag/digest which the platform pins via helm_default_values.
   tag: ""
-  # sha256:... -- when set it WINS over tag and the image is pulled by digest.
-  # The release job PRINTS the published digest in its GitHub step summary; it
-  # does not write it back here, so pinning it is a manual step -- either in
-  # this file at release time, or per release in its instance values, as
-  # deploy/woow-k3s/opendesign.yaml does.
-  digest: ""
   pullPolicy: IfNotPresent
+  # The upstream image CMD hardcodes `--host 0.0.0.0`, and the daemon's CLI flag
+  # OVERRIDES the OD_BIND_HOST env — so without this the daemon ignores
+  # config.bindHost and listens on 0.0.0.0, defeating Option C's loopback bind.
+  # true → the chart overrides the image CMD (keeping its tini ENTRYPOINT) with
+  # `--host <config.bindHost> --port <targetPort> --no-open`, making bindHost
+  # authoritative. Set false only for a stub/alt image that honours OD_BIND_HOST.
+  enforceBindHost: true
 
-# The package is published public, as ghcr.io/woowtech/woow-k3s-pi-agent is
-# (the live pi-agent Deployments pull it with no pull secret), so nothing here
-# is required. The live `opendesign` release nevertheless sets
-# imagePullSecrets: [ghcr-woowtech]; it is harmless, and removing it would
-# rewrite a running pod template for no gain.
+# The daemon image lives in the private jcr-prod registry → the operator forwards
+# the tenant-ns pull secret (e.g. paas-registry). The kubelet pulls the private
+# image; the pod process does not read it.
 imagePullSecrets: []
+#  - name: paas-registry
 
-# ── nginx sidecar ──────────────────────────────────────────────────────────
-# Terminates the pod-network connection so the OpenDesign daemon can stay on
-# 127.0.0.1. It does NO authentication and NO path rewriting -- see
-# files/nginx.conf for the full list of things it must never grow.
-nginx:
-  image:
-    repository: nginx
-    tag: "1.27-alpine"
-    pullPolicy: IfNotPresent
-  # The only port reachable over the pod network.
-  port: 7457
-  # Reject mutating requests (anything but GET/HEAD/OPTIONS) that carry no
-  # Origin header. Keep this true: it closes the one gap left by normalising
-  # Host to the loopback form OpenDesign trusts unconditionally. Set it false
-  # only for non-browser automation that cannot send an Origin, and record why.
-  requireOriginOnMutation: true
+# per-instance, single replica (RWO PVC + Recreate strategy).
+replicaCount: 1
+
+# ── Service (daemon; ClusterIP by default; port pinned 7457) ──────────────────
+# The daemon listens on 7457. External access default = platform subdomain +
+# Cloudflare tunnel → this ClusterIP:7457 (same model as mcp-server /
+# home-assistant). Flip ingress.enabled for a real K8s Ingress instead.
+#
+# service.name: the ecosystem references the daemon as `open-design-svc:7457`
+# (mcp-opendesign's od_api_base). Left "" → the Service is named after the release
+# (fullname) — e.g. svc-{ref[:8]} on the platform, `open-design` locally. Set to
+# "open-design-svc" (or any stable name) to expose the canonical ecosystem name;
+# the platform can then wire mcp-opendesign's od_api_base to a predictable DNS.
+service:
+  type: ClusterIP
+  name: ""
+  port: 7457            # platform default_port; tunnel/ingress routes here
+  targetPort: 7457      # container listen port (OD_PORT — pinned 7457)
+
+# ── Ingress (optional; OFF by default — platform decides) ─────────────────────
+# When enabled, host is supplied by the platform (per-tenant subdomain). Backend
+# is this chart's daemon Service on service.port (7457). TLS optional. Left off by
+# default because the platform's primary external-access path is the Cloudflare
+# tunnel → ClusterIP.
+ingress:
+  enabled: false
+  className: ""         # e.g. traefik / nginx (cluster-dependent)
+  annotations: {}
+  #  cert-manager.io/cluster-issuer: letsencrypt-prod
+  host: ""              # REQUIRED when enabled — the tenant hostname
+  path: /
+  pathType: Prefix
+  tls:
+    enabled: false
+    secretName: ""      # pre-provisioned TLS secret (or cert-manager-managed)
+
+# ── Persistence (TWO independent RWO PVCs; Recreate strategy) ─────────────────
+# OpenDesign needs two stateful mounts (upstream 03-pvc.yaml):
+#   data → /app/.od          : project / design workspace state
+#   home → /home/opendesign  : keeps the claude.ai login session, agent CLI config
+# storageClass left empty → the field is omitted → cluster default StorageClass.
+# BOTH PVCs must live in a paas-ws-* namespace and be reclaimed by operator
+# teardown (paas.woowtech.io/orphaned-at label).
+persistence:
+  # storageClass applied to BOTH PVCs. The platform's generic operator injects it
+  # via _inject_storage_class → persistence.storageClass (default longhorn-delete),
+  # the SAME flat key as home-assistant / mcp-server. Empty → field omitted →
+  # cluster default. Override a single volume with persistence.<vol>.storageClass.
+  storageClass: ""
+  data:
+    enabled: true
+    size: 8Gi
+    accessModes:
+      - ReadWriteOnce
+    storageClass: ""    # "" → inherit persistence.storageClass
+    mountPath: /app/.od
+  home:
+    enabled: true
+    size: 2Gi
+    accessModes:
+      - ReadWriteOnce
+    storageClass: ""    # "" → inherit persistence.storageClass
+    mountPath: /home/opendesign
+
+# ── Home dotfiles seed (seed-if-absent; platform#407) ─────────────────────────
+# The od-home PVC mounts OVER /home/opendesign and shadows the home baked into
+# the image — the kubelet does NOT replay /etc/skel into a fresh volume, so a
+# brand-new instance has NO ~/.bashrc. That matters because the console terminal
+# is `kubectl exec -- /bin/bash` (interactive NON-login shell → sources only
+# /etc/bash.bashrc + ~/.bashrc), making ~/.bashrc THE per-tenant shell hook.
+#
+# A seed-home initContainer (daemon image, uid 1001, od-home mounted) copies the
+# files below from skelDir into the home volume ONLY when the target is absent:
+#   - existing / tenant-edited files are NEVER overwritten;
+#   - it runs on EVERY pod start (not first-install-only), so a file the tenant
+#     deleted is restored on the next restart;
+#   - it is best-effort — an unwritable volume logs a WARN and the pod still
+#     starts (a cosmetic dotfile must never CrashLoop the instance).
+homeSeed:
+  enabled: true
+  # Source directory inside the image. The upstream image ships .bashrc /
+  # .profile / .bash_logout there (root:root 644, world-readable).
+  skelDir: /etc/skel
+  # Files copied skelDir/<f> → persistence.home.mountPath/<f>. A file missing
+  # from skelDir is skipped silently. Overriding REPLACES this list.
+  files:
+    - .bashrc
+    - .profile
+    - .bash_logout
+  # uid the seeder runs as — must match the daemon user (opendesign = 1001) so
+  # the seeded files are owned by whoever the tenant's shell runs as.
+  runAsUser: 1001
+  # "" → reuse the daemon image (no extra pull secret / egress / version skew).
+  # Set to a full ref (repo:tag) only if the daemon image ever drops /etc/skel.
+  image: ""
+  # REQUIRED: the paas-ws-* ResourceQuota mandates requests+limits on EVERY
+  # container including initContainers (without them: FailedCreate "must specify
+  # limits.cpu for: seed-home").
   resources:
     requests:
-      cpu: 20m
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+
+# ── Daemon env / config ───────────────────────────────────────────────────────
+# Non-sensitive daemon env → ConfigMap (upstream 02-config.yaml), consumed via
+# envFrom. OD_DISABLE_API_AUTH is intentionally ABSENT (auth stays ON).
+#
+# AUTH MODEL (Option C — ratified 2026-07-20, issue #380 comment 2650):
+# The upstream OpenDesign web UI CANNOT attach a bearer token, so exposing the
+# daemon directly with OD_API_TOKEN set makes the tenant UI 401 on every /api/*
+# call (evidence: apps/web has no token entry / fetch wrapper; server.ts:2065-2098
+# guards /api/* for non-loopback). Therefore the daemon binds LOOPBACK and is
+# fronted by an nginx auth-proxy sidecar (authProxy.*) that gates access with HTTP
+# basic-auth (the #357-generated admin_password) — a browser-native login, no UI
+# change. OD_API_TOKEN is internalised (nginx reaches the daemon over loopback,
+# which the daemon exempts; the token is defense-in-depth only).
+config:
+  # Browser Origin allowlist for the daemon. The platform MUST pin the tenant origin
+  # (e.g. "https://<tenant>.<platform-domain>") via helm_default_values — the daemon
+  # rejects a PUBLIC browser Origin with 403 unless it is listed here verbatim (its
+  # same-origin fallback only trusts loopback/private-LAN hosts). A bare "*" CRASHES
+  # the daemon (`new URL("*")` → ERR_INVALID_URL) and is treated as unset by the chart;
+  # empty → daemon boots but public-origin requests 403 until a real origin is set.
+  allowedOrigins: ""
+  # Loopback by default (Option C — only the in-pod auth-proxy reaches the daemon).
+  # If you set authProxy.enabled=false you MUST set this to 0.0.0.0 (else nothing
+  # can reach the daemon) — the chart fails the render otherwise.
+  bindHost: "127.0.0.1"
+  # Extra non-sensitive daemon env (map of KEY: value) folded into the ConfigMap.
+  extraConfig: {}
+  # ── Sensitive config (platform #357 has_admin_gui injects here, zero-change —
+  # SAME nested key as mcp-server's config.sensitive). ────────────────────────
+  sensitive:
+    # THE tenant credential (Option C): the auth-proxy HTTP basic-auth password
+    # AND the console gate password. The platform's #357 mechanism generates it,
+    # shows it once in the UI, and supports reset. Empty → the chart self-generates
+    # + persists one (via lookup; stable across helm upgrade).
+    admin_password: ""
+
+# ── Auth proxy (Option C — the tenant-facing gate; upstream proxy-configmap.yaml) ─
+# An nginx-unprivileged sidecar in the daemon pod: listens on authProxy.port, serves
+# the UI at / and proxies /api/* to the loopback daemon, gating everything with HTTP
+# basic-auth (user authProxy.basicAuth.username / password = config.sensitive.admin_password).
+# /api/health,ready,version stay open (kubelet probes + monitoring). SSE-friendly
+# (proxy_buffering off, long read timeout). The daemon Service targets THIS port.
+authProxy:
+  enabled: true
+  image:
+    repository: nginxinc/nginx-unprivileged
+    tag: "1.27-alpine"
+    pullPolicy: IfNotPresent
+  port: 8080
+  # Pin nginx worker count. The base image's default `worker_processes auto` forks one
+  # worker per HOST cpu (NOT cgroup-aware): on a high-core node (e.g. 256 vCPU) that is
+  # 256 workers → blows the small `resources.limits.memory` below → OOMKilled (137)
+  # CrashLoop. A loopback-fronting proxy needs only a couple of workers.
+  workerProcesses: 2
+  workerConnections: 1024
+  basicAuth:
+    enabled: true
+    # Tenant-changeable from the platform (it re-renders this value and
+    # restarts daemon + console). Validated at render time — see
+    # open-design.basicAuthUsername: 1-64 of A-Z a-z 0-9 . _ @ - .
+    username: "admin"
+  # tiny init container (writes the htpasswd from admin_password) + nginx resources.
+  resources:
+    requests:
+      cpu: 25m
       memory: 32Mi
     limits:
       cpu: 200m
       memory: 128Mi
-
-# ── OpenDesign daemon ──────────────────────────────────────────────────────
-opendesign:
-  # Loopback only. NOT a Service port and NOT a containerPort.
-  port: 7456
-  dataDir: /data/opendesign
-  timezone: Asia/Taipei
-
-  # Extra env for the OpenDesign container, for reviewed additions such as
-  # OD_ALLOWED_INTERNAL_HOSTS. OD_BIND_HOST, OD_PORT, OD_DATA_DIR,
-  # OD_ALLOWED_ORIGINS and OD_PUBLIC_BASE_URL are chart-owned and are rejected
-  # here; so are the API-token and disabled-auth switches, which this
-  # deployment does not need and must never set.
-  #
-  # THIS MAP IS RENDERED INTO THE -config ConfigMap IN CLEARTEXT. Anything with
-  # get on ConfigMaps in the namespace can read it, and `helm get values` echoes
-  # it back. Nothing that behaves like a credential belongs here -- that is what
-  # extraEnvSecret below is for.
-  extraEnv: {}
-
-  # Render-time guard: fail when a key in extraEnv looks like a credential
-  # (anything ending in _API_KEY, _TOKEN, _SECRET, _PASSWORD).
-  #
-  # Ships false, deliberately. The live `opendesign` release passes an
-  # OpenRouter key through extraEnv today, and flipping this on by default
-  # would make its own values un-renderable. Flip it to true in the instance
-  # values once that key has moved to extraEnvSecret.
-  rejectSecretShapedExtraEnv: false
-
-  # Extra env taken from a Secret instead of the ConfigMap. envFrom keeps the
-  # values out of the ConfigMap, out of the pod spec and out of
-  # `helm get values`; only the Secret NAME is ever rendered.
-  #
-  # Every default here is off, so the rendered Deployment is byte-identical to
-  # a release installed before this key existed.
-  extraEnvSecret:
-    # true appends envFrom.secretRef to the OpenDesign container. That CHANGES
-    # THE POD TEMPLATE, so turning it on rolls the pod once.
-    enabled: false
-    # Name of the Secret. Empty means <fullname>-extra-env.
-    name: ""
-    # true tolerates the Secret being absent at pod start (the kubelet skips
-    # it). Keep false: a silently missing variable is worse than a pod that
-    # refuses to start.
-    optional: false
-    # false (the default) means the Secret already exists and is managed OUT OF
-    # BAND -- `kubectl create secret generic`, or whatever the namespace
-    # already uses. The chart only references it by name.
-    #
-    # true renders the Secret from `data` below, with required() on every
-    # value, so an empty one is a render failure rather than an empty variable.
-    # Use it only where the values file itself is never committed: values
-    # passed to `helm install` also land in the release Secret, base64-encoded
-    # but not encrypted. See examples/secrets.example.yaml.
-    create: false
-    # KEY: value pairs, read only when create: true.
-    data: {}
-
-  # Sized for one headless Chromium render at a time (the renderer holds a
-  # Semaphore(1)) with MAX_PIXELS 48,000,000 -- a 48 MP RGBA bitmap alone is
-  # ~183 MiB before Chromium's own overhead -- and MAX_OUTPUT_BYTES 128 MiB
-  # buffered per export. The request is what the pod actually needs while idle
-  # and serving the UI; the limit is the live release's proven ceiling.
-  resources:
+  initResources:
     requests:
-      cpu: 500m
-      memory: 2Gi
+      cpu: 10m
+      memory: 16Mi
     limits:
-      cpu: "4"
-      memory: 8Gi
+      cpu: 100m
+      memory: 64Mi
 
-# ── Service ────────────────────────────────────────────────────────────────
-service:
-  # ClusterIP only. `type` is deliberately NOT configurable: NodePort or
-  # LoadBalancer would publish OpenDesign past Nginx Proxy Manager, which is
-  # the whole authentication boundary. values.schema.json rejects a `type` key.
-  port: 7457
-  annotations: {}
+# ── Auth / secrets ────────────────────────────────────────────────────────────
+# Sensitive env. Route mirrors mcp-server (#357): the CD/operator injects an
+# existingSecret (no plaintext in values), OR the chart creates its own Secret.
+# admin_password (config.sensitive above) is the tenant credential. OD_API_TOKEN is
+# an INTERNAL daemon secret (defense-in-depth; the tenant never sees it). Both
+# self-generate + persist via `lookup` when empty (stable across helm upgrade).
+auth:
+  # When set, the chart creates NO Secret; the named Secret MUST carry keys:
+  # admin_password (required), OD_API_TOKEN (optional), ANTHROPIC_API_KEY (optional),
+  # OPENROUTER_API_KEY (optional).
+  existingSecret: ""
+  # INTERNAL daemon API token (defense-in-depth; nginx→daemon is loopback-exempt so
+  # this is rarely exercised). Empty → self-generated + persisted. NOT tenant-facing.
+  odApiToken: ""
+  # Anthropic API key (OPTIONAL). Empty → omitted; the tenant can `claude login`
+  # interactively via the console TUI (persisted on the od-home PVC).
+  anthropicApiKey: ""
+  # OpenRouter API key (OPTIONAL) for the in-container OpenCode runtime — a
+  # server-side key shared by every browser session of this instance. BYOK keys
+  # typed in the web UI stay in the browser and are unaffected. Empty → omitted.
+  openrouterApiKey: ""
 
-# ── Storage ────────────────────────────────────────────────────────────────
-# NOTE: this cluster has TWO StorageClasses annotated is-default-class=true
-# (local-path and longhorn), so an omitted storageClassName is resolved by an
-# ambiguous tiebreak. Every PVC here names its class explicitly.
-persistence:
-  data:
-    # `longhorn` is reclaimPolicy Retain and allowVolumeExpansion true.
-    # Never longhorn-delete (Delete) or local-path (Delete, single node, no
-    # expansion) -- that is the posture that left the previous deployment's
-    # ~204 MiB of tenant data one `helm uninstall` from gone.
-    storageClassName: longhorn
-    size: 20Gi
-    accessModes:
-      - ReadWriteOnce
-    # Extra annotations only. `helm.sh/resource-policy: keep` comes from the
-    # top-level keepOnUninstall and must not be repeated here.
-    annotations: {}
+# ── Probes (daemon; GET /api/health on 7457 — upstream 04-deployment.yaml) ─────
+readinessProbe:
+  initialDelaySeconds: 20
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 12
+livenessProbe:
+  initialDelaySeconds: 60
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 5
 
-# ── Backup ─────────────────────────────────────────────────────────────────
-# Longhorn has no working backup target on this cluster
-# (backuptargets/default reports available: false, zero recurringjobs), so the
-# chart ships its own tar-to-a-second-PVC CronJob rather than delegating.
-# This survives a bad `helm uninstall` or an accidental PVC delete. It does
-# NOT survive loss of the cluster -- for off-site durability configure a
-# Longhorn backup target or add an upload step.
-backup:
+# ── Pod hardening (daemon) ────────────────────────────────────────────────────
+# fsGroup 1001 so BOTH RWO PVCs are group-writable by the opendesign user (uid
+# 1001, home /home/opendesign) — upstream 04-deployment.yaml. runAsNonRoot /
+# readOnlyRootFilesystem are intentionally NOT forced: the daemon runs agent CLIs
+# (Claude Code / OpenCode) that write into $HOME and /app/.od. Conservative stance
+# mirrors home-assistant — tighten via values once the image is verified.
+podSecurityContext:
+  fsGroup: 1001
+securityContext: {}
+#  allowPrivilegeEscalation: false
+#  capabilities:
+#    drop:
+#      - ALL
+
+# ── Resources (daemon — the platform's heaviest service) ──────────────────────
+resources:
+  requests:
+    cpu: "1"
+    memory: 2Gi
+  limits:
+    cpu: "4"
+    memory: 8Gi
+
+# Extra env for the daemon container (list of {name, value}). e.g. TZ.
+extraEnv: []
+#  - name: TZ
+#    value: Asia/Taipei
+
+terminationGracePeriodSeconds: 30
+
+serviceAccount:
+  create: true
+  name: ""
+  # the daemon pod does not talk to the K8s API → no token automount (blast radius).
+  automountToken: false
+
+# ── Console (web dashboard + ttyd terminal; upstream 07/08/09-console-*.yaml) ──
+# An optional management console: Flask dashboard (:18790) + ttyd web terminal
+# (:7681) that kubectl-execs into the daemon pod via a scoped SA/RBAC. Toggle off
+# to run the daemon alone.
+# Option C gate (同一閘): BOTH the ttyd terminal AND the Flask dashboard require
+# HTTP basic-auth with the SAME tenant credential as the daemon proxy
+# (user authProxy.basicAuth.username / password = config.sensitive.admin_password).
+console:
   enabled: true
-  # 03:17 daily. CronJob schedules are evaluated in the cluster's timezone.
-  schedule: "17 3 * * *"
-  # Archives to keep on the backup PVC.
-  retain: 7
-  persistence:
-    storageClassName: longhorn
-    size: 20Gi
-    accessModes:
-      - ReadWriteOnce
-    annotations: {}
+
+  # Expose the ttyd web terminal externally at <public-url><externalPath>, proxied
+  # by the auth-proxy → console pod, so tenants can reach the TUI (`claude login`,
+  # which execs into the daemon) WITHOUT cluster access. Requires authProxy.enabled.
+  # ttyd runs with `-b <externalPath>` so its asset/WS paths match the sub-path;
+  # ttyd keeps its own basic-auth (same admin_password) as the gate. Set to "" to
+  # disable the external route (console then stays ClusterIP-only). gap #49.
+  externalPath: "/console"
+
+  # ── Console image ──────────────────────────────────────────────────────────
+  # runtimeInstall=false (DEFAULT, RECOMMENDED): use a baked image that already
+  # ships ttyd + kubectl + python + flask/requests (see Dockerfile.console, built
+  # by paas-ci). The app code (app.py/entrypoint.py/connect.sh/index.html) is
+  # injected from the chart ConfigMap at startup (chart-owned, hot-updatable) — the
+  # container only copies + execs, NO network downloads. egress-safe & restart-fast.
+  #
+  # runtimeInstall=true: FAITHFUL upstream fallback — python:3.9-slim + a bootstrap
+  # that curls ttyd (GitHub) + kubectl (dl.k8s.io) and pip-installs flask at
+  # startup. Requires egress to github.com / dl.k8s.io / pypi on EVERY restart;
+  # under tenant NetworkPolicy egress limits this can FAIL. Use only where a baked
+  # image is unavailable and egress is open.
+  runtimeInstall: false
+  image:
+    repository: jcr-prod.woowtech.io/woow-paas-docker-local/open-design-console
+    tag: "latest"
+    pullPolicy: IfNotPresent
+  # Base image used ONLY when runtimeInstall=true.
+  runtimeInstallBaseImage: "python:3.9-slim"
+  # Pinned tool versions for the runtimeInstall bootstrap (ignored in baked mode).
+  ttydVersion: "1.7.7"
+
+  service:
+    type: ClusterIP
+    dashboardPort: 18790   # Flask dashboard
+    ttydPort: 7681         # ttyd web terminal
+
   resources:
     requests:
-      cpu: 50m
-      memory: 64Mi
+      cpu: 100m
+      memory: 128Mi
     limits:
       cpu: 500m
       memory: 512Mi
 
-# ── NetworkPolicy ──────────────────────────────────────────────────────────
-# Modelled byte-for-byte on the five live pi-agent policies so the fleet stays
-# uniform. Port 7456 is deliberately absent: the daemon is bound to 127.0.0.1
-# and is not reachable over the pod network at all, so no rule can name it.
-# Kubelet probes are exempt from NetworkPolicy and hit the sidecar directly.
-networkPolicy:
-  enabled: true
-  # Pods allowed to reach the nginx sidecar. Same namespace, so this is a bare
-  # podSelector -- no namespaceSelector, no label to add elsewhere.
-  fromPodLabels:
-    app: npm
-  # Extra CIDRs allowed in (LAN admin/debug), matching the pi-agent fleet.
-  fromCIDRs:
-    - 192.168.0.0/16
-  # Add one more ingress peer -- sidecar port only -- selecting the `helm test`
-  # hook pod (component=helm-test, this release). Without it the hook cannot
-  # reach the Service while this policy is in force and `helm test` times out.
-  #
-  # Ships false so the rendered NetworkPolicy stays byte-identical to the live
-  # release's. Turning it on rewrites ONE NetworkPolicy and rolls nothing.
-  allowHelmTest: false
-  # Egress: DNS to kube-dns, then everything EXCEPT the pod CIDR, the service
-  # CIDR, the LAN and the metadata IP.
-  egressExcept:
-    - 10.42.0.0/16
-    - 10.43.0.0/16
-    - 192.168.0.0/16
-    - 169.254.169.254/32
-
-# ── Probes ─────────────────────────────────────────────────────────────────
-# All three run against http://:7457/api/health on the nginx sidecar, which is
-# the only port on the pod network. OpenDesign's origin middleware exempts
-# health/version for monitoring probes, and a 200 there proves the whole chain
-# nginx -> 127.0.0.1:7456 -> daemon is up.
-# startup is generous: Chromium plus OpenDesign cold-starting on a freshly
-# attached Longhorn volume is slow (60 x 10s = 10 minutes of grace).
-probes:
-  startup:
+  # console readiness/liveness (tcpSocket on the dashboard port). The runtimeInstall
+  # bootstrap is slow (downloads + pip) → generous initialDelay; baked mode is fast
+  # but the same generous values are harmless.
+  readinessProbe:
+    initialDelaySeconds: 60
     periodSeconds: 10
-    failureThreshold: 60
-    timeoutSeconds: 5
-  readiness:
-    periodSeconds: 10
-    failureThreshold: 3
-    timeoutSeconds: 5
-  liveness:
+    failureThreshold: 12
+  livenessProbe:
+    initialDelaySeconds: 120
     periodSeconds: 30
     failureThreshold: 5
-    timeoutSeconds: 10
 
-# ── helm test ──────────────────────────────────────────────────────────────
-# A read-only smoke hook: one short-lived pod that GETs /api/health and
-# /api/version through the Service, over exactly the path Nginx Proxy Manager
-# uses. It writes nothing, mounts no PVC, and reuses the already-pinned
-# OpenDesign image, so no extra image has to be pulled or trusted.
-#
-# It deliberately does NOT carry the chart's selector labels: a pod that did
-# would join the Service EndpointSlice and black-hole a share of live requests
-# for as long as it ran.
-#
-# With networkPolicy.enabled: true it also needs networkPolicy.allowHelmTest.
-helmTest:
+  # RBAC (Role scoped to THIS release's daemon): find/exec/logs the daemon pod,
+  # rollout-restart the daemon Deployment (PATCH, by name), patch the daemon Secret
+  # (API-key updates). false → SA still created but with no grants (kubectl degrades).
+  rbac:
+    create: true
+
+  terminationGracePeriodSeconds: 15
+
+  podLabels: {}
+  podAnnotations: {}
+
+# ── NetworkPolicy (default-deny + converged egress; np-audit #42) ─────────────
+# CRITICAL (np-audit #42 F-1/2/3): the daemon runs AI agent CLIs (arbitrary egress)
+# and the console can kubectl-exec — egress IS the attack surface. Egress is NEVER
+# a bare `- {}` allow-all (that let the pod reach in-cluster control-plane ClusterIPs
+# like paas-operator + SSRF cloud metadata). Internet egress goes through an ipBlock
+# that EXCLUDES cluster Pod/Service CIDR + RFC1918 + metadata + CGNAT + loopback,
+# on TCP 443/80 only. Modelled on the verified charts/agent-runtime §6.3 template.
+networkPolicy:
   enabled: true
-  # Attempts per GET, two seconds apart. The hook pod is created seconds before
-  # it runs and the NetworkPolicy admitting it is enforced from an ipset keyed on
-  # its IP, which the policy controller has to learn first; connecting too early
-  # is REJECTED and looks exactly like a broken Service. One attempt made
-  # back-to-back `helm test` runs fail about half the time.
-  retries: 15
-  resources:
-    requests:
-      cpu: 20m
-      memory: 32Mi
-    limits:
-      cpu: 200m
-      memory: 256Mi
+  # Namespaces allowed to reach the daemon proxy / console, matched by
+  # kubernetes.io/metadata.name. EMPTY (default) → NO ingress allow rule; CS-ns
+  # ingress is governed by the operator baseline NetworkPolicy (#279/#280).
+  ingressNamespaces: []
+  # allowAllEgress=true → allow INTERNET egress (daemon → Anthropic/agent CLIs) via
+  # the SAFE ipBlock below (NOT 0.0.0.0/0 open). false → egress is DNS-only for the
+  # daemon (DNS + apiserver for the console) — locks the pod to the cluster.
+  allowAllEgress: true
+  # TCP ports allowed for internet egress.
+  externalPorts:
+    - 443
+    - 80
+  # CIDRs EXCLUDED from internet egress. 10.0.0.0/8 subsumes the woow-k3s Pod CIDR
+  # (10.42.0.0/16) and Service CIDR (10.43.0.0/16) → in-cluster ClusterIPs (incl.
+  # paas-operator + kube-apiserver) are unreachable via the internet rule.
+  # 169.254.0.0/16 blocks cloud-metadata SSRF (F-3). ⚠ PLATFORM: confirm the actual
+  # cluster Pod/Service CIDR if it falls outside 10.0.0.0/8.
+  egressExcludeCidrs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 169.254.0.0/16   # link-local incl. cloud metadata 169.254.169.254
+    - 100.64.0.0/10    # CGNAT (Tailscale / WARP)
+    - 127.0.0.0/8
+  # Console kubectl → kube-apiserver. EXPLICIT allowlist (never allow-all). The
+  # apiserver ClusterIP lives in the excluded Service CIDR, so it needs its own hole.
+  # ⚠ PLATFORM: set the real target(s). Default = the k3s kubernetes service ClusterIP;
+  # add the control-plane node endpoint (<nodeIP>/32) if your CNI matches egress
+  # post-DNAT. Empty → the console emits NO apiserver egress (kubectl will be blocked).
+  apiServerCidrs:
+    - 10.43.0.1/32
+  apiServerPorts:
+    - 443
+    - 6443
+  # DNS egress narrowed to the kube-dns pods (k8s-app=kube-dns) rather than the whole
+  # kube-system namespace (np-audit F-7). Set false if your cluster DNS isn't labelled.
+  dnsKubeDnsOnly: true
 
-# ── Scheduling / misc ──────────────────────────────────────────────────────
-podAnnotations: {}
 podLabels: {}
-# Intentionally empty. Longhorn is distributed with dataLocality disabled;
-# `strategy: Recreate` is what handles the RWO single-attach constraint, not
-# node pinning. The old chart's `__K3S_NODE_HOSTNAME__` placeholder here is
-# exactly what made it uninstallable.
+podAnnotations: {}
 nodeSelector: {}
-tolerations: []
 affinity: {}
-priorityClassName: ""
-terminationGracePeriodSeconds: 60
+tolerations: []
+nameOverride: ""
+fullnameOverride: ""

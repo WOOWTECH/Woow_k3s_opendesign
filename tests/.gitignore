@@ -1,3 +1,0 @@
-# Written by tests/lib/extract-chart-assets.py on every run of tests/run.sh.
-.artifacts/
-lib/__pycache__/

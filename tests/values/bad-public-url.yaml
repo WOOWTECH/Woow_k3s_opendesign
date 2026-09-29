@@ -1,2 +1,0 @@
-# Negative fixture: not an https:// origin. Rendering MUST fail.
-publicUrl: "http://od-woow-k3s.woowtech.io"

@@ -1,9 +1,0 @@
-{
-  "name": "woow-k3s-opendesign-runtime",
-  "version": "2.0.1",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "playwright-core": "1.55.0"
-  }
-}

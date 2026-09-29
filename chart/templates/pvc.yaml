@@ -1,63 +1,41 @@
-{{/*
-One data volume. HOME is $OD_DATA_DIR/home, so the old chart's second
-"home" PVC is folded in here: one volume, one restore unit, no way for the
-two to drift.
-storageClassName is ALWAYS set explicitly -- this cluster has two
-StorageClasses annotated is-default-class=true (local-path and longhorn), so
-omitting it resolves by an ambiguous tiebreak.
-`helm.sh/resource-policy: keep` comes from the top-level keepOnUninstall, so
-one switch governs every stateful object instead of an annotation map that can
-be edited out per PVC by accident.
-*/}}
-{{- $keep := dict -}}
-{{- range $k, $v := (.Values.persistence.data.annotations | default dict) }}
-{{- $_ := set $keep $k $v }}
-{{- end }}
-{{- if .Values.keepOnUninstall }}
-{{- $_ := set $keep "helm.sh/resource-policy" "keep" }}
-{{- end }}
+{{- /* storageClass: per-volume override wins, else the flat persistence.storageClass
+       (the key the platform operator's _inject_storage_class targets). */ -}}
+{{- if .Values.persistence.data.enabled }}
+{{- $dataSC := .Values.persistence.data.storageClass | default .Values.persistence.storageClass }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "opendesign.fullname" . }}-data
+  name: {{ include "open-design.dataPvcName" . }}
   labels:
-    {{- include "opendesign.labels" . | nindent 4 }}
-  {{- with $keep }}
-  annotations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
+    {{- include "open-design.labels" . | nindent 4 }}
+    open-design.woowtech.io/volume: data
 spec:
   accessModes:
     {{- toYaml .Values.persistence.data.accessModes | nindent 4 }}
-  storageClassName: {{ required "persistence.data.storageClassName must be set explicitly (two StorageClasses on this cluster claim is-default-class)" .Values.persistence.data.storageClassName | quote }}
   resources:
     requests:
-      storage: {{ required "persistence.data.size is required" .Values.persistence.data.size | quote }}
-{{- if .Values.backup.enabled }}
-{{- $backupKeep := dict -}}
-{{- range $k, $v := (.Values.backup.persistence.annotations | default dict) }}
-{{- $_ := set $backupKeep $k $v }}
+      storage: {{ .Values.persistence.data.size }}
+  {{- with $dataSC }}
+  storageClassName: {{ . }}
+  {{- end }}
 {{- end }}
-{{- if .Values.keepOnUninstall }}
-{{- $_ := set $backupKeep "helm.sh/resource-policy" "keep" }}
-{{- end }}
+{{- if .Values.persistence.home.enabled }}
+{{- $homeSC := .Values.persistence.home.storageClass | default .Values.persistence.storageClass }}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "opendesign.fullname" . }}-backup
+  name: {{ include "open-design.homePvcName" . }}
   labels:
-    {{- include "opendesign.labels" . | nindent 4 }}
-    app.kubernetes.io/component: backup
-  {{- with $backupKeep }}
-  annotations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
+    {{- include "open-design.labels" . | nindent 4 }}
+    open-design.woowtech.io/volume: home
 spec:
   accessModes:
-    {{- toYaml .Values.backup.persistence.accessModes | nindent 4 }}
-  storageClassName: {{ required "backup.persistence.storageClassName must be set explicitly" .Values.backup.persistence.storageClassName | quote }}
+    {{- toYaml .Values.persistence.home.accessModes | nindent 4 }}
   resources:
     requests:
-      storage: {{ required "backup.persistence.size is required" .Values.backup.persistence.size | quote }}
+      storage: {{ .Values.persistence.home.size }}
+  {{- with $homeSC }}
+  storageClassName: {{ . }}
+  {{- end }}
 {{- end }}
