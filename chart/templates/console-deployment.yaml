@@ -138,8 +138,17 @@ spec:
             {{- end }}
             # Console gate (Option C — "同一閘"): ttyd basic-auth AND the Flask
             # dashboard basic-auth both use the tenant admin_password (user below).
+            # From the Secret, not a literal: a username change must not change this
+            # pod template either (see deployment.yaml).
             - name: CONSOLE_BASIC_USER
+              {{- if .Values.auth.existingSecret }}
               value: {{ include "open-design.basicAuthUsername" . | quote }}
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-design.secretName" . }}
+                  key: admin_username
+              {{- end }}
             - name: TUI_PASSWORD
               valueFrom:
                 secretKeyRef:

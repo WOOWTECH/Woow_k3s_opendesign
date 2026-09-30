@@ -122,6 +122,7 @@ console 的 ServiceAccount（`serviceaccount.yaml`）綁一條 per-release 的 *
 | 0.1.3 | console entrypoint `os.waitpid(-1)` 孤兒誤殺修復（關終端不再重啟容器）| issue #52 / PR #53 |
 | 0.1.4 | `seed-home` initContainer：把 `/etc/skel` 的 `.bashrc` / `.profile` / `.bash_logout` **缺才補**進 od-home PVC（空 home 沒有 `~/.bashrc`，租戶 shell 客製無處落地）| platform issue #407 |
 | 0.2.0 | OpenDesign **0.24.1** image（上游預建 `ghcr.io/nexu-io/od` 為 base + Claude Code／OpenCode）；`authProxy.basicAuth.username` 開放租戶自改並於 render 時驗證（`open-design.basicAuthUsername`：1–64 字元 `A-Z a-z 0-9 . _ @ -`，含 `:`／空白／空值直接 fail render）；新增選填 `auth.openrouterApiKey` → Secret `OPENROUTER_API_KEY`（daemon env optional）。daemon 啟動參數不變（上游仍附 `apps/daemon/bin/od.mjs`）| paas-odoo-ci #151 |
+| 0.2.1 | 帳號改放 chart Secret（`admin_username`），htpasswd init 與 console 都以 `secretKeyRef` 讀取。之前帳號以字面值寫在 pod 設定裡，改帳號＝改 pod 設定，operator 的 reset（`helm --atomic --timeout 15s`）要等新 pod（30–70 秒）必定逾時回退，且回退過程斷線約 1 分鐘；現在改帳號只動 Secret | — |
 
 ## 相關
 

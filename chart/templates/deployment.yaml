@@ -135,8 +135,23 @@ spec:
               chmod 644 /auth/.htpasswd
               echo "[authproxy-init] htpasswd written for user '$BASIC_USER'"
           env:
+            # The username is read from the chart Secret (not written into the pod spec) so
+            # a username change only touches the Secret: the pod template stays identical,
+            # the operator's reset (`helm upgrade --atomic --timeout 15s`, i.e. --wait) returns
+            # at once, and its rollout restart applies the new credential. A literal value here
+            # changes the pod template, forcing helm to wait for a new pod (30-70 s) inside
+            # 15 s — every username change rolled back and cost ~1 min of downtime.
+            # An external auth.existingSecret may not carry admin_username, so that mode keeps
+            # the literal value.
             - name: BASIC_USER
+              {{- if .Values.auth.existingSecret }}
               value: {{ include "open-design.basicAuthUsername" . | quote }}
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-design.secretName" . }}
+                  key: admin_username
+              {{- end }}
             - name: ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
