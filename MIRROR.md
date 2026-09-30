@@ -14,11 +14,11 @@ overwrites them. Open the change against the Gitea repository instead.
 <!-- BEGIN GENERATED: scripts/sync-from-gitea.sh -->
 | Mirror path | Source repository | Source path | Commit |
 |---|---|---|---|
-| `image/` | `woow-paas/paas-odoo-ci` | `open-design/` | `93323965cbf81e9c842ab7fe6963baa010356a0f` |
-| `console/` | `woow-paas/paas-odoo-ci` | `open-design-console/` | `93323965cbf81e9c842ab7fe6963baa010356a0f` |
-| `chart/` | `woow-paas/woow-paas-charts` | `charts/open-design/` | `11cc55cf8b4712568693f11c2172f35073e4cb93` |
+| `image/` | `woow-paas/paas-odoo-ci` | `open-design/` | `2a1dc8a7a9cad69b83385d5771d0bbe1ccba2617` |
+| `console/` | `woow-paas/paas-odoo-ci` | `open-design-console/` | `2a1dc8a7a9cad69b83385d5771d0bbe1ccba2617` |
+| `chart/` | `woow-paas/woow-paas-charts` | `charts/open-design/` | `2d41c78f5a009666ea6625678c752c042036ae23` |
 
-Chart `0.2.0` / OpenDesign `0.24.1` — synced 2026-09-29 02:12 UTC.
+Chart `0.2.1` / OpenDesign `0.24.1` — synced 2026-09-30 08:20 UTC.
 <!-- END GENERATED -->
 
 ## What each directory is

@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.0.1 — resync (2026-09-30)
+
+- `chart/` → **0.2.1** (`woow-paas/woow-paas-charts` #91): the basic-auth username
+  moves into the chart Secret (`admin_username`); the htpasswd init container and
+  the console read it via `secretKeyRef`, so changing the username no longer
+  changes a pod template (it used to time out the platform's reset and roll back).
+  This is the chart production runs.
+- `image/` and `console/` are unchanged (same content as 3.0.0).
+
 ## 3.0.0 — PaaS mirror (2026-09-29)
 
 This repository now **mirrors the WOOW PaaS open-design sources** from the

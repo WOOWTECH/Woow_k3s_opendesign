@@ -27,7 +27,10 @@ type: application
 # authProxy.basicAuth.username becomes tenant-changeable and is validated at
 # render; optional auth.openrouterApiKey → OPENROUTER_API_KEY. The daemon
 # command (apps/daemon/bin/od.mjs) is unchanged — upstream still ships it.
-version: 0.2.0
+# 0.2.1 = the basic-auth username moves into the chart Secret (admin_username); the
+# htpasswd init and the console read it via secretKeyRef, so a username change no
+# longer changes a pod template (it used to time out the 15 s reset and roll back).
+version: 0.2.1
 # appVersion tracks the upstream OpenDesign release (nexu-io/open-design).
 # The platform pins the real image tag@digest via helm_default_values.
 appVersion: "0.24.1"

@@ -14,7 +14,7 @@ changes are reviewed and approved there, then synced here with
 |---|---|
 | [`image/`](image/) | OpenDesign daemon image — upstream `ghcr.io/nexu-io/od` **0.24.1** + Claude Code **2.1.284** + OpenCode **1.18.33**, with a build-time version contract |
 | [`console/`](console/) | Console image — ttyd web terminal + Flask dashboard |
-| [`chart/`](chart/) | Per-tenant Helm chart **0.2.0** installed by the PaaS operator |
+| [`chart/`](chart/) | Per-tenant Helm chart **0.2.1** installed by the PaaS operator |
 
 Source commits for each directory are recorded in [MIRROR.md](MIRROR.md).
 

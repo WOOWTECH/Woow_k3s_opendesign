@@ -25,7 +25,7 @@
 | OpenDesign | **0.24.1**（以上游官方預建 image `ghcr.io/nexu-io/od` 為基底，digest 釘死） |
 | Claude Code | **2.1.284** |
 | OpenCode | **1.18.33** |
-| Chart | **0.2.0** |
+| Chart | **0.2.1** |
 
 `image/Dockerfile` 最後一步是 build 時的檢查：Claude Code 與 OpenCode 版本必須完全相符、
 所有工具都要在 PATH 上，任何一項不符 build 就會失敗，不會產出有問題的 image。
