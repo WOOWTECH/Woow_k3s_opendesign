@@ -11,6 +11,8 @@
 - `console/` follows `open-design-console/`.
 - CI: the daemon image is built on the public digest-pinned core (`OD_CORE`, `ghcr.io/woowtech/open-design-core`) because
   the shell has no default `CORE`; three chart tests that need the woow-paas-charts layout are skipped here (they run in Gitea CI).
+- CI: yq 4.44.6 → 4.53.6 (sha256 checked against the release `checksums`); the chart's egress-profile test reads multi-document
+  `helm template` output and needs the newer `select(...) // ` semantics.
 - Sources: `woow-paas/paas-odoo-ci` and `woow-paas/woow-paas-charts` commits are in [MIRROR.md](MIRROR.md).
 
 ## 3.0.1 — resync (2026-09-30)
