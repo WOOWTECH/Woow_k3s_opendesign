@@ -1,0 +1,13 @@
+{
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": ["open-design"],
+  "permissions": {
+    "allow": [
+      "mcp__open-design"
+    ],
+    "deny": [
+      "mcp__open-design__delete_project",
+      "mcp__open-design__delete_file"
+    ]
+  }
+}

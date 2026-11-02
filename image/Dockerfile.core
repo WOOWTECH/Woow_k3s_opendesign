@@ -1,0 +1,297 @@
+# open-design-core: the OpenDesign image both WoowTech shells build FROM
+# (PaaS: open-design/Dockerfile in this repo; HA: WOOWTECH/Woow_ha_opendesign_add_on).
+# Published once by build-open-design-image.yml as
+# woow-paas-docker-local/open-design-core:<tag> (same tag and approval as the PaaS
+# image) and copied by digest to ghcr.io/woowtech/open-design-core for HA. amd64 only.
+#
+# Stages: core-base (CLIs, toolchain and Woow patches), core-omnigent (SDK
+# 0.16.0 and all five reviewed patches), core (license and change notice).
+# The native daemon owns the host lifecycle. Shells run tini -> daemon directly.
+# No optional stage may silently omit the accepted native integration.
+#
+# Base = OpenDesign built from the WoowTech fork (woow-paas/open-design, pinned in
+# od-source.env) with the fork's deploy/Dockerfile — upstream's own strict build
+# (pnpm install --frozen-lockfile), the same file and node base that produce
+# ghcr.io/nexu-io/od. Layout is upstream's: node:24-alpine, WORKDIR /app, daemon at
+# apps/daemon, data dir /app/.od, user open-design uid/gid 1001. The workflow builds
+# that base first and passes it here; this file only adds tools on top, as before.
+#
+# No default on purpose: a build without the fork base fails instead of silently
+# shipping upstream's daemon/web without the WoowTech changes.
+ARG OD_BASE
+FROM ${OD_BASE} AS core-base
+
+ARG OD_SOURCE_SHA
+ARG OD_UPSTREAM_SHA
+# Upstream release the fork builds on (od-source.env OD_UPSTREAM_VERSION). No default:
+# the workflow passes it and checks /api/version against it (see OD_APP_VERSION below).
+ARG OD_UPSTREAM_VERSION
+ARG CLAUDE_CODE_VERSION=2.1.296
+ARG CODEX_VERSION=0.162.1
+ARG PI_VERSION=1.1.0
+ARG OPENCODE_VERSION=1.18.33
+ARG SVGO_VERSION=4.1.0
+ARG MERMAID_CLI_VERSION=12.0.0
+ARG SHARP_CLI_VERSION=6.1.0
+ARG UV_VERSION=0.12.20
+ARG UV_SHA256=14114d66a094f1907af0fcbc863f34226bbb7f5e430e13dce6676ba40dcc6891
+# Alpine v3.24 package lines (apk "~" = this version prefix, so security -rN
+# rebuilds still install but a new upstream line fails the build). tmux stays in every
+# core (the HA add-on uses it; omnigent's native Claude/pi harnesses need >= 3.3).
+ARG TMUX_APK=3.7
+ARG PPTXGENJS_VERSION=4.0.1
+ARG PYTHON_PPTX_VERSION=1.0.2
+
+USER root
+
+# Puppeteer (pulled in by mermaid-cli) must not download its own Chrome:
+# there is no glibc Chrome for Alpine. It uses the Alpine chromium below.
+ENV PUPPETEER_SKIP_DOWNLOAD=1 \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
+
+# Toolchain the agents (Claude Code / OpenCode) and design skills call out to.
+# libgcc/libstdc++ + ripgrep are Claude Code's documented Alpine prerequisites;
+# gcompat for the Codex CLI's native binary (same set as the HA add-on image).
+# poppler-utils, tini, git and bash already come from the base image.
+RUN apk add --no-cache \
+      bash curl ca-certificates git jq ripgrep unzip wget "tmux~${TMUX_APK}" \
+      libgcc libstdc++ gcompat \
+      chromium font-noto-cjk font-noto-emoji fontconfig ttf-dejavu \
+      ffmpeg sox pngquant ghostscript vips-tools \
+      python3 py3-pip \
+    && fc-cache -f
+
+# Agent CLIs + design npm tools, all pinned. Every version is asserted below:
+# a mismatch or a missing binary FAILS the build instead of shipping silently
+# (the previous image swallowed install failures with `|| echo`).
+# Codex and Pi are the two extra coding agents OpenDesign's Local AI scan picks up
+# (versions identical to the HA add-on). Pi is installed with --ignore-scripts as in
+# the HA add-on: its postinstall only fetches optional extras at install time.
+RUN npm install -g --omit=dev \
+      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+      "@openai/codex@${CODEX_VERSION}" \
+      "opencode-ai@${OPENCODE_VERSION}" \
+      "svgo@${SVGO_VERSION}" \
+      "@mermaid-js/mermaid-cli@${MERMAID_CLI_VERSION}" \
+      "sharp-cli@${SHARP_CLI_VERSION}" \
+      "pptxgenjs@${PPTXGENJS_VERSION}" \
+    && npm install -g --omit=dev --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+    && npm cache clean --force
+
+# uv / uvx (musl build; the platform is amd64-only). The cluster's github.com
+# downloads get reset mid-stream: fetch with retries and check the release sha256.
+RUN curl -fsSL --retry 8 --retry-all-errors --retry-delay 5 -o /tmp/uv.tar.gz \
+      "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-musl.tar.gz" \
+    && echo "${UV_SHA256}  /tmp/uv.tar.gz" | sha256sum -c - \
+    && tar xzf /tmp/uv.tar.gz -C /tmp \
+    && install -m 0755 /tmp/uv-x86_64-unknown-linux-musl/uv /tmp/uv-x86_64-unknown-linux-musl/uvx /usr/local/bin/ \
+    && rm -rf /tmp/uv-* /tmp/uv.tar.gz \
+    && uv --version | grep -q "^uv ${UV_VERSION}"
+
+# The upstream "brainstorming" skill is not offered on this platform.
+RUN rm -rf /app/skills/brainstorming && test ! -e /app/skills/brainstorming
+
+# Python helpers used by design skills (search, HTTP, imaging, templating).
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir \
+         ddgs anthropic openai httpx requests aiohttp websockets \
+         pillow lxml rich Jinja2 Markdown PyYAML click \
+         "python-pptx==${PYTHON_PPTX_VERSION}"
+
+# Home directory. The chart mounts the od-home PVC at /home/opendesign, which
+# hides whatever the image puts there, so the dotfiles live in /etc/skel and
+# the chart's seed-home init container copies them in (seed-if-absent).
+# The upstream user is a system user with no home and /sbin/nologin; point its
+# passwd entry at the real home and bash, since tools that read the passwd
+# home (OpenCode among them) would otherwise resolve a missing directory.
+RUN mkdir -p /home/opendesign /etc/skel \
+    && printf '%s\n' \
+         '# ~/.bashrc — seeded once by the chart; yours to edit.' \
+         'export PATH="/opt/venv/bin:$PATH"' \
+         'PS1='"'"'\u@opendesign:\w\$ '"'"'' \
+         > /etc/skel/.bashrc \
+    && printf '%s\n' '[ -f ~/.bashrc ] && . ~/.bashrc' > /etc/skel/.profile \
+    && printf '%s\n' '# ~/.bash_logout' > /etc/skel/.bash_logout \
+    && cp /etc/skel/.bashrc /etc/skel/.profile /etc/skel/.bash_logout /home/opendesign/ \
+    && awk -F: 'BEGIN{OFS=":"} $1=="open-design"{$6="/home/opendesign";$7="/bin/bash"} {print}' /etc/passwd > /tmp/passwd \
+    && cat /tmp/passwd > /etc/passwd && rm /tmp/passwd \
+    && chown -R open-design:open-design /home/opendesign /app/.od
+
+ENV HOME=/home/opendesign \
+    PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    USE_BUILTIN_RIPGREP=0 \
+    NODE_OPTIONS=--max-old-space-size=4096 \
+    NODE_PATH=/usr/local/lib/node_modules \
+    OD_BIND_HOST=127.0.0.1 \
+    OD_PORT=7457
+
+# Build-time contract. Runs as the runtime user so a binary that only works
+# for root fails here, not in a tenant pod.
+USER open-design
+RUN set -e; \
+    test "$(id -u)" = "1001"; \
+    test "$(getent passwd open-design | cut -d: -f6)" = "/home/opendesign"; \
+    test -f /app/apps/daemon/bin/od.mjs; \
+    test -f /app/apps/daemon/dist/cli.js; \
+    v=$(claude --version | awk '{print $1}');   test "$v" = "${CLAUDE_CODE_VERSION}" || { echo "claude $v != ${CLAUDE_CODE_VERSION}"; exit 1; }; \
+    v=$(opencode --version | tr -d '[:space:]'); test "$v" = "${OPENCODE_VERSION}"   || { echo "opencode $v != ${OPENCODE_VERSION}"; exit 1; }; \
+    v=$(codex --version | awk '{print $2}');    test "$v" = "${CODEX_VERSION}"      || { echo "codex $v != ${CODEX_VERSION}"; exit 1; }; \
+    v=$(pi --version | tr -d '[:space:]');      test "$v" = "${PI_VERSION}"         || { echo "pi $v != ${PI_VERSION}"; exit 1; }; \
+    test ! -e /app/skills/brainstorming; \
+    node -e 'require("pptxgenjs")'; \
+    for b in node npm git bash rg jq curl chromium-browser ffmpeg pdftotext svgo mmdc sharp uv uvx python3 tmux flock setsid; do \
+      command -v "$b" >/dev/null || { echo "missing: $b"; exit 1; }; \
+    done; \
+    /opt/venv/bin/python -c 'import ddgs, anthropic, openai, httpx, PIL, lxml, jinja2, yaml, pptx'; \
+    if command -v omnigent >/dev/null || [ -e /opt/omnigent ]; then echo "omnigent present in the core base"; exit 1; fi; \
+    echo "contract OK: claude ${CLAUDE_CODE_VERSION}, codex ${CODEX_VERSION}, pi ${PI_VERSION}, opencode ${OPENCODE_VERSION}"
+
+# ── WOOW patches to the upstream OpenDesign build (round-1 QA; open-design/woow-patches/) ──
+# Each patch is an exact-text edit of the built files that FAILS the build when its
+# target no longer matches (an upstream bump must re-check them), and runs as the owner
+# of /app (uid 1001) so file ownership stays as upstream ships it.
+# ISS-OD-01: deck "Save as PDF" printed only the active slide (print CSS specificity).
+# deck-print-check.mjs builds a 3-slide deck from the framework for the workflow's
+# print check (fixed: 3 PDF pages, unfixed: 1).
+COPY woow-patches/deck-print.sh woow-patches/deck-print-check.mjs /usr/local/share/woow/patches/
+RUN sh /usr/local/share/woow/patches/deck-print.sh
+# ISS-OD-05: export / blob preview resolved project-relative assets (<img src="logo.svg">)
+# against the site root; the fallback <base href> becomes the project's raw directory.
+COPY woow-patches/export-basehref.py /usr/local/share/woow/patches/
+RUN python3 /usr/local/share/woow/patches/export-basehref.py /app/apps/web/out
+# ISS-OD-08: the zh-TW UI locale still had zh-CN strings; converted with OpenCC s2twp
+# (mapping generated offline and committed, applied to the zh-TW dictionary only).
+COPY woow-patches/zh-tw-locale.py woow-patches/zh-TW-s2twp.json /usr/local/share/woow/patches/
+RUN python3 /usr/local/share/woow/patches/zh-tw-locale.py apply /app/apps/web/out /usr/local/share/woow/patches/zh-TW-s2twp.json
+# ISS-OD-11: white label — no upstream NPS/CSAT survey, no OpenDesign Cloud / Discord / X
+# promo links (injected at the top of every page of the static web export).
+COPY woow-patches/white-label.py /usr/local/share/woow/patches/
+RUN python3 /usr/local/share/woow/patches/white-label.py /app/apps/web/out
+# #1439 (R8 white label, round 2): "Contact us" → WoowTech (support@woowtech.io and
+# /_woow/support, which the chart's auth proxy redirects to whiteLabel.supportUrl); no
+# "switch to OpenDesign Cloud" callback (it stored the unusable agent amr as the shared
+# default); leftover upstream community links → WoowTech; the "not signed in" error says
+# where to sign in on this platform. After zh-tw-locale.py: it matches that patch's zh-TW text.
+COPY woow-patches/white-label-links.py /usr/local/share/woow/patches/
+RUN python3 /usr/local/share/woow/patches/white-label-links.py /app/apps/web/out
+# ISS-OD-05 (image export): "Export as image" rasterises the preview's DOM through an SVG
+# <foreignObject>, which never loads external images — project assets (the logo) were
+# missing. The snapshot bridge (daemon-injected + web copy) now inlines loaded <img> as
+# data URLs. Last on purpose: the layers above stay cached.
+COPY woow-patches/snapshot-inline-img.py /usr/local/share/woow/patches/
+RUN python3 /usr/local/share/woow/patches/snapshot-inline-img.py /app
+
+LABEL io.woow.opendesign.source-revision="${OD_SOURCE_SHA}" \
+      io.woow.opendesign.upstream-revision="${OD_UPSTREAM_SHA}"
+
+# AI-OD-001-1: upstream open-design-v0.24.1 still ships package.json version 0.23.1 (root
+# and apps/daemon — not bumped upstream), and the daemon reports that file in /api/version,
+# /api/health and diagnostics, so a 0.24.1 image answered 0.23.1. The daemon prefers
+# OD_APP_VERSION over package.json (apps/daemon/src/app-version.ts, the packaged desktop
+# app's own mechanism), so pin it to the release this image is built from. ENV only (no
+# layer); the workflow fails when /api/version differs from od-source.env.
+ENV OD_APP_VERSION=${OD_UPSTREAM_VERSION}
+
+# ── Native Omnigent: included in every published core ─────────────────────────
+FROM core-base AS core-omnigent
+ARG CLAUDE_CODE_VERSION=2.1.296
+ARG OMNIGENT_VERSION=0.16.0
+# uv-managed CPython for the omnigent venv, pinned to the patch release (uv checks
+# the download against its built-in sha256 table).
+ARG OMNIGENT_PYTHON=3.12.14
+ARG RE2_APK=2025.11.05
+ARG ABSEIL_APK=20250814
+ARG ICU_APK=78
+USER root
+# The native daemon discovers this read-only SDK and starts its bundled host-kit
+# only after GUI setup. Config/state defaults come from the daemon data root;
+# never set OMNIGENT_CONFIG_HOME or OMNIGENT_DATA_DIR to a legacy home here.
+# Supply chain: omnigent and all ~94 transitive dependencies come from
+# omnigent-requirements.lock (sha256-pinned, --require-hashes). Alpine/musl: only
+# google-re2 (via cel-python) and claude-agent-sdk have no musllinux wheel; both are
+# built from their hash-pinned sdists with --no-build-isolation, using the
+# hash-pinned build tools from omnigent-build-requirements.lock (removed afterwards),
+# so no unpinned build dependency is ever downloaded. google-re2 needs c++,
+# re2/abseil headers and pybind11 headers (apk, removed after the build); its runtime
+# libs (re2, abseil, icu) are installed separately FIRST so `apk del` keeps them.
+# claude-agent-sdk's sdist has no _bundled/claude, so it uses the musl-native
+# `claude` on PATH (the pinned Claude Code above); asserted by the in-container
+# contract RUN at the end (claude-agent-sdk's own _find_cli()). Bytecode is
+# compiled at build time (UV_COMPILE_BYTECODE=1), so the read-only venv never writes
+# __pycache__ at runtime.
+# The cluster's dl-cdn throughput is low and uneven (gcc alone took ~4 min in run 12128,
+# the first apk layer ~25 min): each attempt is bounded at 30 min and retried; the
+# packages are predownloaded into a build-local cache dir (apk-tools 3), so a retry does
+# not re-download what already arrived; a stalled connection aborts after 120 s.
+COPY omnigent-requirements.lock omnigent-build-requirements.lock /tmp/omnigent-lock/
+RUN set -eu; \
+    mkdir -p /tmp/apk-cache; \
+    apk_retry() { for i in 1 2 3; do timeout 1800 apk add --cache-dir /tmp/apk-cache --cache-packages --cache-predownload --timeout 120 "$@" && return 0; echo "apk add retry $i"; sleep 10; done; return 1; }; \
+    apk_retry "re2~${RE2_APK}" "abseil-cpp~${ABSEIL_APK}" "icu-libs~${ICU_APK}"; \
+    apk_retry --virtual .og-build build-base "re2-dev~${RE2_APK}" "abseil-cpp-dev~${ABSEIL_APK}" linux-headers py3-pybind11-dev; \
+    export UV_PYTHON_INSTALL_DIR=/opt/omnigent/python UV_PYTHON_PREFERENCE=only-managed \
+           UV_NO_CACHE=1 UV_COMPILE_BYTECODE=1 UV_HTTP_RETRIES=8 UV_HTTP_TIMEOUT=120; \
+    L=/tmp/omnigent-lock; PY=/opt/omnigent/venv/bin/python; \
+    uv venv --python "${OMNIGENT_PYTHON}" /opt/omnigent/venv; \
+    "$PY" -c 'import sys; v=".".join(map(str, sys.version_info[:3])); assert v == sys.argv[1], v' "${OMNIGENT_PYTHON}"; \
+    uv pip install --python "$PY" --require-hashes -r "$L/omnigent-build-requirements.lock"; \
+    uv pip install --python "$PY" --require-hashes --no-build-isolation -r "$L/omnigent-requirements.lock"; \
+    names() { sed -n 's/^\([A-Za-z0-9][A-Za-z0-9_.-]*\)==.*/\1/p' "$1" | tr 'A-Z_.' 'a-z--' | sort -u; }; \
+    names "$L/omnigent-requirements.lock" > /tmp/og-keep; \
+    for p in $(names "$L/omnigent-build-requirements.lock"); do grep -qx "$p" /tmp/og-keep || uv pip uninstall --python "$PY" "$p"; done; \
+    uv pip check --python "$PY"; \
+    uv pip freeze --python "$PY" | sed -n 's/^\([A-Za-z0-9][A-Za-z0-9_.-]*\)==.*/\1/p' | tr 'A-Z_.' 'a-z--' | sort -u > /tmp/og-have; \
+    diff /tmp/og-keep /tmp/og-have || { echo "venv does not match omnigent-requirements.lock"; exit 1; }; \
+    apk del .og-build; \
+    SDK=$("$PY" -c 'import claude_agent_sdk, os; print(os.path.dirname(claude_agent_sdk.__file__))'); \
+    test -d "$SDK"; rm -f "$SDK/_bundled/claude"; test ! -e "$SDK/_bundled/claude"; \
+    ln -sf /opt/omnigent/venv/bin/omnigent /usr/local/bin/omnigent; \
+    OMNIGENT_CONFIG_HOME=/tmp/og OMNIGENT_DATA_DIR=/tmp/og omnigent --version 2>&1 | grep -q "${OMNIGENT_VERSION}" || { omnigent --version; exit 1; }; \
+    "$PY" -c "import claude_agent_sdk, omnigent, re2, celpy, yaml"; \
+    rm -rf /tmp/og /tmp/apk-cache /tmp/omnigent-lock /tmp/og-keep /tmp/og-have; \
+    chmod -R a+rX,go-w /opt/omnigent
+
+# Reviewed SDK 0.16.0 patches: host model options, quota errors, native interrupt,
+# Pi custom-provider model options, and dual OpenCode user config merge.
+# Apply and verify with the venv Python (the installer validates sys.prefix and
+# installed package metadata). Every patch, baseline and result is sha256 checked.
+COPY omnigent-sdk-patches/apply.py omnigent-sdk-patches/*.patch omnigent-sdk-patches/manifest.json /usr/local/share/woow/omnigent-sdk-patches/
+COPY omnigent-sdk-patches/tests/check_provider_merge.py /usr/local/share/woow/omnigent-sdk-patches/check_provider_merge.py
+COPY omnigent-host-kit.json /usr/local/share/woow/omnigent-host-kit.json
+COPY verify-omnigent-runtime.py /usr/local/share/woow/verify-omnigent-runtime.py
+RUN set -eu; \
+    PY=/opt/omnigent/venv/bin/python; \
+    SDK=$("$PY" -I -B -c 'from importlib.util import find_spec; print(list(find_spec("omnigent").submodule_search_locations)[0])'); \
+    "$PY" -I -B /usr/local/share/woow/omnigent-sdk-patches/apply.py "$SDK" /usr/local/share/woow/omnigent-sdk-patches/manifest.json; \
+    "$PY" -I -B /usr/local/share/woow/omnigent-sdk-patches/apply.py "$SDK" /usr/local/share/woow/omnigent-sdk-patches/manifest.json --check; \
+    "$PY" -m compileall -q "$SDK"; \
+    chmod -R a+rX,go-w /opt/omnigent
+
+# Omnigent contract (moved out of the core-base contract): the daemon's fork adapter parses
+# with the omnigent python, the CLI version, the venv entry point and bytecode, tmux >= 3.3.
+USER open-design
+RUN set -e; \
+    /opt/omnigent/venv/bin/python -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' /app/apps/daemon/dist/integrations/omnigent/adapter.py; \
+    v=$(OMNIGENT_CONFIG_HOME=/tmp/ogc OMNIGENT_DATA_DIR=/tmp/ogc omnigent --version 2>&1); rm -rf /tmp/ogc; \
+    echo "$v" | grep -q "${OMNIGENT_VERSION}" || { echo "omnigent $v != ${OMNIGENT_VERSION}"; exit 1; }; \
+    /opt/omnigent/venv/bin/python -c 'import claude_agent_sdk, omnigent, re2, celpy, yaml, httpx; from omnigent.cli_auth import stored_token_status, load_token, refresh_stored_token'; \
+    case "$(head -n1 "$(readlink -f "$(command -v omnigent)")")" in '#!/opt/omnigent/venv/bin/python'*) ;; *) echo "omnigent is not the venv entry point"; exit 1 ;; esac; \
+    pyc=$(find /opt/omnigent/venv/lib -path '*/site-packages/omnigent/__pycache__/*.cpython-312.pyc' | head -n1); test -n "$pyc" || { echo "omnigent bytecode not compiled"; exit 1; }; \
+    tv=$(tmux -V | sed 's/^tmux //'); case "$tv" in 3.[3-9]*|[4-9].*) ;; *) echo "tmux $tv < 3.3"; exit 1 ;; esac; \
+    echo "contract OK: omnigent ${OMNIGENT_VERSION}"
+
+# SDK CLI resolution and native packaged-asset contract, as the runtime uid.
+USER root
+COPY build-contract-omnigent.py /usr/local/share/woow/build-contract-omnigent.py
+USER open-design
+RUN /opt/omnigent/venv/bin/python -I -B /usr/local/share/woow/build-contract-omnigent.py "${CLAUDE_CODE_VERSION}" \
+    && /opt/omnigent/venv/bin/python -I -B /usr/local/share/woow/verify-omnigent-runtime.py
+
+FROM core-omnigent AS core
+USER open-design
+# Apache-2.0 §4(a)/(b): the license of the OpenDesign source this image is built from
+# (byte-identical to the fork's LICENSE; the workflow checks it) and WoowTech's notice
+# of what the fork and this image change. One layer, root-owned, read-only for all.
+COPY core-legal/ /usr/share/

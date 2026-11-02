@@ -39,7 +39,7 @@ HASTUI="$(printf '%s' "$SEC" | yq '.stringData | has("TUI_PASSWORD")')"
 
 # daemon injects OD_API_TOKEN as env from the Secret (optional — loopback-exempt).
 ENVREF="$(printf '%s' "$OUT" \
-  | yq 'select(.kind=="Deployment" and .metadata.labels."app.kubernetes.io/component"=="daemon") | .spec.template.spec.containers[0].env[] | select(.name=="OD_API_TOKEN") | .valueFrom.secretKeyRef.name')"
+  | yq 'select(.kind=="StatefulSet" and .metadata.labels."app.kubernetes.io/component"=="daemon") | .spec.template.spec.containers[0].env[] | select(.name=="OD_API_TOKEN") | .valueFrom.secretKeyRef.name')"
 [ "$ENVREF" = "t-open-design-secrets" ] || fail "daemon OD_API_TOKEN secretRef='$ENVREF', expected t-open-design-secrets"
 
 # config.sensitive.admin_password pin honoured (platform #357 injection point).
@@ -51,7 +51,7 @@ PIN="$($HELM template t "$CHART_DIR" --set config.sensitive.admin_password=PINNE
 EXT="$($HELM template t "$CHART_DIR" --set auth.existingSecret=od-ext 2>/dev/null)"
 EXTSEC="$(printf '%s' "$EXT" | yq 'select(.kind=="Secret" and .metadata.name=="t-open-design-secrets") | .metadata.name')"
 [ -z "$EXTSEC" ] || fail "existingSecret set but chart still rendered its own Secret"
-EXTREF="$(printf '%s' "$EXT" | yq 'select(.kind=="Deployment" and .metadata.labels."app.kubernetes.io/component"=="daemon") | .spec.template.spec.containers[0].env[] | select(.name=="OD_API_TOKEN") | .valueFrom.secretKeyRef.name')"
+EXTREF="$(printf '%s' "$EXT" | yq 'select(.kind=="StatefulSet" and .metadata.labels."app.kubernetes.io/component"=="daemon") | .spec.template.spec.containers[0].env[] | select(.name=="OD_API_TOKEN") | .valueFrom.secretKeyRef.name')"
 [ "$EXTREF" = "od-ext" ] || fail "daemon OD_API_TOKEN secretRef='$EXTREF', expected od-ext"
 
 echo "PASS (secret-auth): no OD_DISABLE_API_AUTH, loopback bind, admin_password+OD_API_TOKEN in Secret, #357 pin honoured, existingSecret suppresses chart Secret."

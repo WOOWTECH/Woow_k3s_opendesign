@@ -11,14 +11,13 @@ metadata:
     {{- include "open-design.console.labels" . | nindent 4 }}
 {{- if .Values.console.rbac.create }}
 ---
-# Namespaced Role, no cluster-wide grants. The Deployment + Secret rules ARE scoped
-# by name to this release's daemon. NOTE (np-audit #42 F-5): pods / pods/exec /
-# pods/log CANNOT be resourceName-scoped to a dynamically-named daemon pod, so those
-# verbs apply to ANY pod in THIS release's namespace — i.e. the console can exec into
-# sibling pods in the SAME tenant namespace. Containment rests on the platform's
-# per-tenant namespace isolation (paas-ws-*), NOT on this Role: the reachable pods are
-# the tenant's own. The app only ever targets the daemon (by label), but RBAC cannot
-# enforce that narrowing.
+# Namespaced Role, no cluster-wide grants, and EVERY rule is pinned by resourceNames
+# to this release's own objects (#1360). The workspace namespace also hosts the
+# tenant's other services (Odoo + PostgreSQL, n8n, Hermes, mcp-* tokens), so a
+# namespace-wide pods/exec would let anyone holding the OpenDesign credential exec
+# into all of them. The daemon is a StatefulSet precisely so its pod name
+# (<fullname>-0) is known here; RBAC cannot select pods by label.
+# No list/watch on anything: the console never enumerates the namespace.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -26,29 +25,32 @@ metadata:
   labels:
     {{- include "open-design.console.labels" . | nindent 4 }}
 rules:
-  # Find pods (namespace-scoped — see the F-5 note above).
+  # `kubectl exec POD` / `kubectl logs POD` GET the pod first; the terminal waits on it.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list"]
-  # Exec into pods (critical for the ttyd terminal; namespace-scoped — F-5 note).
+    resourceNames: ["{{ include "open-design.daemonPodName" . }}"]
+    verbs: ["get"]
+  # Exec into the daemon (the ttyd terminal, dashboard health/agents probes).
   - apiGroups: [""]
     resources: ["pods/exec"]
+    resourceNames: ["{{ include "open-design.daemonPodName" . }}"]
     verbs: ["create", "get"]
-  # Read pod logs (namespace-scoped — F-5 note).
+  # Read the daemon's logs.
   - apiGroups: [""]
     resources: ["pods/log"]
+    resourceNames: ["{{ include "open-design.daemonPodName" . }}"]
     verbs: ["get"]
-  # Restart the daemon Deployment (rollout restart = PATCH; scoped by name). The
-  # console never uses the scale subresource, so it is intentionally NOT granted.
+  # Restart the daemon (rollout restart = PATCH of the pod template annotation). The
+  # console never scales, so the scale subresource is intentionally NOT granted.
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["statefulsets"]
     resourceNames: ["{{ include "open-design.fullname" . }}"]
     verbs: ["get", "patch"]
-  # Manage the daemon Secret (API-key updates via the console). Scoped by name.
-  - apiGroups: [""]
-    resources: ["secrets"]
-    resourceNames: ["{{ include "open-design.secretName" . }}"]
-    verbs: ["get", "patch", "update"]
+  # NO Secret access (console-ttyd-exposure, X-SEC-005-4 / AI-HER-008-6): nothing in the
+  # console (app.py, connect.sh, entrypoint.py) reads or writes the chart Secret — the
+  # admin password reaches it as env (secretKeyRef, resolved by the kubelet, not by this
+  # SA). The old get/patch/update rule only let a token stolen from the console pod read
+  # admin_password / API keys and rewrite them. Key changes go through the platform.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

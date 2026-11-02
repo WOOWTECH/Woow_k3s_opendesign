@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/WOOWTECH/opendesign-omnigent",
+  "commit": "05b23f5a5259d4f2c22e5c6e3eb92ce9103ed34a",
+  "path": "deploy/omnigent/sdk-patches",
+  "files": {
+    "apply.py": "5bca4dff467dc122557993e8c35d30ea8025aa2e13c88590a70705a4fd3a5e4e",
+    "manifest.json": "76be590d5110e30f8f8c76f75a7b144cf5863ab89583126648308a6642e7fab4",
+    "opencode-host-model-options.patch": "54766dd9edc5f49b6041660feb9911a362508520d7c200daf80e9e12422a3599",
+    "opencode-quota-error.patch": "c9c7e01533b8f54b3628a74420b2492e406e5fe2d2a156f91ffe5ac440cc4d27",
+    "opencode-native-interrupt.patch": "ac611bedf3413b4d9ffe6cdcbad336b948d2a8e096efe917f5b626f6e97a3803",
+    "pi-custom-model-options.patch": "f9a34fbc8f2a793c1b95026aa910b8275637e8cca5e59845a0a61b0963146086",
+    "opencode-user-config-merge.patch": "72fabaaee347a17938f305a09dd7fb9808ff7c0c03bc1aa46ba9e52f8ec028e3",
+    "tests/check_provider_merge.py": "8835ac183af6255cb659f2da8639f6d605ab27345436a754de764aa3ab6dbbfd"
+  }
+}

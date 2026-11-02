@@ -1,0 +1,6 @@
+[
+  {"name": "short", "origin": "https://fixture.invalid"},
+  {"name": "paas", "origin": "https://svc-01234567-open-design.ws-89abcdef.tenant-platform.fixture.invalid"},
+  {"name": "max-dns", "labelLengths": [63, 63, 63, 61]},
+  {"name": "max-dns-port", "labelLengths": [63, 63, 63, 61], "port": 65535}
+]

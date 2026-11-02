@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 2,
+  "sdkVersion": "0.16.0",
+  "patches": [
+    {
+      "patch": "opencode-host-model-options.patch",
+      "patchSha256": "54766dd9edc5f49b6041660feb9911a362508520d7c200daf80e9e12422a3599",
+      "files": [
+        {
+          "sdkRelativePath": "host/connect.py",
+          "baseSha256": "1093a7c89de966c39e598f683b2651073abf613152e4e875676135bd28138ad1",
+          "replacementSha256": "2de8af76672e8008731c7fe4500eec059cd0d54b68091a8b364f631af911d75e"
+        }
+      ]
+    },
+    {
+      "patch": "opencode-quota-error.patch",
+      "patchSha256": "c9c7e01533b8f54b3628a74420b2492e406e5fe2d2a156f91ffe5ac440cc4d27",
+      "files": [
+        {
+          "sdkRelativePath": "harnesses/opencode_native/forwarder.py",
+          "baseSha256": "90d003af26cdf5a17f75bb2084e03b35a987577f79a42cbaa540130d82128527",
+          "replacementSha256": "79813db586b43a28adf790f5ba26c1d1f04f782e09833298fcb2f5009da555b2"
+        }
+      ]
+    },
+    {
+      "patch": "opencode-native-interrupt.patch",
+      "patchSha256": "ac611bedf3413b4d9ffe6cdcbad336b948d2a8e096efe917f5b626f6e97a3803",
+      "files": [
+        {
+          "sdkRelativePath": "runner/native/interrupt.py",
+          "baseSha256": "315c16d408214372bd8f567274e1bdbf945e9d783ff9cc81456cfc37fc651aad",
+          "replacementSha256": "422350957c6164cddb8f4d16b7c79c09561eace9bc1f43f802b6f79bbb562cb7"
+        }
+      ]
+    },
+    {
+      "patch": "pi-custom-model-options.patch",
+      "patchSha256": "f9a34fbc8f2a793c1b95026aa910b8275637e8cca5e59845a0a61b0963146086",
+      "files": [
+        {
+          "sdkRelativePath": "harnesses/pi_native/credentials.py",
+          "baseSha256": "371b3d604a26d5e1e64bb75fcc99d29b10a1c601edc596ea48ee32e6198d23c5",
+          "replacementSha256": "3e9def2efd0b5f369c74befc460fc263540716fc4d6644f182876403b19a3d86"
+        }
+      ]
+    },
+    {
+      "patch": "opencode-user-config-merge.patch",
+      "patchSha256": "72fabaaee347a17938f305a09dd7fb9808ff7c0c03bc1aa46ba9e52f8ec028e3",
+      "files": [
+        {
+          "sdkRelativePath": "harnesses/opencode_native/provider.py",
+          "baseSha256": "090aa95923cbc0149e7f459a2767aa2cd26b5304bfb78a21fc056246f9cd51b1",
+          "replacementSha256": "a460658db89ebdc308cb4bb271e9f36d5da7ab440ed5006e9c2460979899dd92"
+        }
+      ]
+    }
+  ]
+}

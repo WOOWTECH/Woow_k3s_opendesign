@@ -5,8 +5,10 @@
 #   - console.enabled=false → NONE of the above rendered (daemon only)
 #   - baked mode (default) → image = console.image.*, command has NO downloads
 #   - runtimeInstall=true → image = python:3.9-slim, command downloads ttyd/kubectl
-#   - console env targets templatized (POD_LABEL/DAEMON_DEPLOYMENT match the release)
-#   - RBAC Role resourceNames scoped to THIS release's daemon Deployment + Secret
+#   - console env targets templatized (DAEMON_POD/DAEMON_STATEFULSET match the release)
+#   - #1360: EVERY Role rule is pinned by resourceNames to this release's objects —
+#     pods / pods/exec / pods/log to the daemon pod <fullname>-0 (StatefulSet), the
+#     statefulset by name; no Secret access (0.5.3); no list/watch/*; no label selectors
 #
 # Usage:    bash charts/open-design/tests/test-console-toggle.sh
 # Requires: helm + yq (mikefarah).
@@ -45,15 +47,41 @@ RCMD="$(printf '%s' "$RT" | yq 'select(.kind=="Deployment" and .metadata.name=="
 printf '%s' "$RCMD" | grep -q 'dl.k8s.io' || fail "runtimeInstall command missing the kubectl download"
 
 # console env targets templatized to THIS release.
-POD_LABEL="$(printf '%s' "$ON" | yq 'select(.kind=="Deployment" and .metadata.name=="t-open-design-console") | .spec.template.spec.containers[0].env[] | select(.name=="POD_LABEL") | .value')"
-printf '%s' "$POD_LABEL" | grep -q 'app.kubernetes.io/instance=t' || fail "console POD_LABEL not templatized to release (got '$POD_LABEL')"
-DDEP="$(printf '%s' "$ON" | yq 'select(.kind=="Deployment" and .metadata.name=="t-open-design-console") | .spec.template.spec.containers[0].env[] | select(.name=="DAEMON_DEPLOYMENT") | .value')"
-[ "$DDEP" = "t-open-design" ] || fail "console DAEMON_DEPLOYMENT='$DDEP', expected t-open-design"
+cenv() { printf '%s' "$ON" | yq 'select(.kind=="Deployment" and .metadata.name=="t-open-design-console") | .spec.template.spec.containers[0].env[] | select(.name=="'"$1"'") | .value'; }
+[ "$(cenv DAEMON_POD)" = "t-open-design-0" ] || fail "console DAEMON_POD='$(cenv DAEMON_POD)', expected t-open-design-0"
+[ "$(cenv DAEMON_STATEFULSET)" = "t-open-design" ] || fail "console DAEMON_STATEFULSET='$(cenv DAEMON_STATEFULSET)', expected t-open-design"
+for gone in POD_LABEL DAEMON_DEPLOYMENT DAEMON_SERVICE; do
+  [ -z "$(cenv $gone)" ] || fail "console env $gone must be gone (#1360: fixed pod name, no discovery)"
+done
+# The pod name the console targets IS the StatefulSet's ordinal-0 pod.
+STS="$(printf '%s' "$ON" | yq 'select(.kind=="StatefulSet" and .metadata.labels."app.kubernetes.io/component"=="daemon") | .metadata.name')"
+[ "$STS-0" = "$(cenv DAEMON_POD)" ] || fail "DAEMON_POD does not match the daemon StatefulSet ordinal 0 ('$STS')"
 
-# RBAC resourceNames scoped to the release's daemon Deployment + Secret.
-DEPRN="$(printf '%s' "$ON" | yq 'select(.kind=="Role") | .rules[] | select(.resources[0]=="deployments") | .resourceNames[0]')"
-[ "$DEPRN" = "t-open-design" ] || fail "Role deployment resourceName='$DEPRN', expected t-open-design"
-SECRN="$(printf '%s' "$ON" | yq 'select(.kind=="Role") | .rules[] | select(.resources[0]=="secrets") | .resourceNames[0]')"
-[ "$SECRN" = "t-open-design-secrets" ] || fail "Role secret resourceName='$SECRN', expected t-open-design-secrets"
+# #1360: every rule pinned by name — no namespace-wide grant of any kind.
+ROLE="$(printf '%s' "$ON" | yq 'select(.kind=="Role")')"
+UNPINNED="$(printf '%s' "$ROLE" | yq '[.rules[] | select((.resourceNames // []) | length == 0)] | length')"
+[ "$UNPINNED" = "0" ] || fail "console Role has $UNPINNED rule(s) without resourceNames — namespace-wide (#1360)"
+printf '%s' "$ROLE" | yq '.rules[].verbs[]' | grep -qxE 'list|watch|\*' && fail "console Role must not list/watch/* anything (#1360)"
+rn() { printf '%s' "$ROLE" | yq '.rules[] | select(.resources[0]=="'"$1"'") | .resourceNames | join(",")'; }
+for r in pods pods/exec pods/log; do
+  [ "$(rn $r)" = "t-open-design-0" ] || fail "Role $r resourceNames='$(rn $r)', expected t-open-design-0 only"
+done
+[ "$(rn statefulsets)" = "t-open-design" ] || fail "Role statefulsets resourceNames='$(rn statefulsets)', expected t-open-design"
+[ -z "$(rn secrets)" ] || fail "Role must not grant secrets (console-ttyd-exposure, 0.5.3)"
+[ -z "$(rn deployments)$(rn endpoints)" ] || fail "Role must not grant deployments/endpoints any more"
+RES="$(printf '%s' "$ROLE" | yq '[.rules[].resources[]] | sort | join(",")')"
+[ "$RES" = "pods,pods/exec,pods/log,statefulsets" ] || fail "unexpected Role resources '$RES'"
+# fullnameOverride flows into every pinned name.
+FO="$($HELM template t "$CHART_DIR" --set fullnameOverride=od 2>/dev/null | yq 'select(.kind=="Role") | .rules[] | select(.resources[0]=="pods/exec") | .resourceNames[0]')"
+[ "$FO" = "od-0" ] || fail "fullnameOverride: pods/exec resourceName='$FO', expected od-0"
+# A name too long for a StatefulSet fails the render instead of breaking the rollout.
+if $HELM template t "$CHART_DIR" --set fullnameOverride="$(printf 'a%.0s' $(seq 1 53))" >/dev/null 2>&1; then
+  fail "a 53-character fullname must fail the render (StatefulSet name limit)"
+fi
+SCRIPTS="$(printf '%s' "$ON" | yq 'select(.kind=="ConfigMap" and .metadata.name=="t-open-design-console-scripts") | .data | to_entries | .[].value')"
+# here-strings, not `printf | grep -q`: under pipefail an early grep exit SIGPIPEs printf.
+grep -qE '"-l"|get pods? -l|get endpoints|get pods(\s|")' <<<"$SCRIPTS" && fail "console scripts must only address the fixed daemon pod (no -l / listing)"
+grep -q '"statefulset/%s" % DAEMON_STATEFULSET' <<<"$SCRIPTS" || fail "console restart must target the daemon StatefulSet"
+grep -q 'POD="${DAEMON_POD' <<<"$SCRIPTS" || fail "connect.sh must use DAEMON_POD"
 
-echo "PASS (console-toggle): enable/disable, baked vs runtimeInstall, env targets templatized, RBAC scoped by name."
+echo "PASS (console-toggle): enable/disable, baked vs runtimeInstall, env targets templatized, every RBAC rule pinned to the daemon pod / own objects (#1360)."

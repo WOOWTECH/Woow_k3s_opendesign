@@ -1,0 +1,13 @@
+{{- $paseo := include "open-design.paseo" . | fromYaml -}}
+{{- if $paseo.enabled }}
+{{- include "open-design.paseoValidate" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open-design.fullname" . }}-paseo-launch
+  labels:
+    {{- include "open-design.labels" . | nindent 4 }}
+data:
+  launch.py: |
+{{ .Files.Get "files/paseo-launch.py" | indent 4 }}
+{{- end }}

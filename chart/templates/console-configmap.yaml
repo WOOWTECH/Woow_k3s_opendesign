@@ -2,7 +2,7 @@
 # Console app code — chart-owned, injected into the console container at startup
 # (baked mode) or after the runtime bootstrap (runtimeInstall mode). Kept in a
 # ConfigMap so app changes ship WITHOUT rebuilding the console image. Targets are
-# env-driven (POD_LABEL / DAEMON_CONTAINER / DAEMON_DEPLOYMENT / DAEMON_PORT) so
+# env-driven (DAEMON_POD / DAEMON_CONTAINER / DAEMON_STATEFULSET / DAEMON_PORT) so
 # the console works under any release name (e.g. svc-{ref[:8]}), unlike the
 # upstream hard-coded "app=open-design".
 apiVersion: v1
@@ -28,10 +28,10 @@ data:
     app = Flask(__name__)
 
     NAMESPACE = os.environ.get("NAMESPACE", "open-design")
-    POD_LABEL = os.environ.get("POD_LABEL", "app=open-design")
     CONTAINER = os.environ.get("DAEMON_CONTAINER", "open-design")
     DAEMON_PORT = os.environ.get("DAEMON_PORT", "7457")
-    DAEMON_DEPLOYMENT = os.environ.get("DAEMON_DEPLOYMENT", "open-design")
+    DAEMON_STATEFULSET = os.environ.get("DAEMON_STATEFULSET", "open-design")
+    DAEMON_POD = os.environ.get("DAEMON_POD", "open-design-0")
     DASHBOARD_PORT = int(os.environ.get("CONSOLE_DASHBOARD_PORT", "18790"))
 
     # Console gate (Option C — "同一閘"): HTTP basic-auth using the tenant
@@ -83,23 +83,12 @@ data:
 
 
     def get_pod_name():
-        """Find the running open-design pod (cached)."""
-        cached = _cache_get("pod_name")
-        if cached is not None:
-            return cached
-        try:
-            result = subprocess.run(
-                ["kubectl", "get", "pod", "-l", POD_LABEL, "-n", NAMESPACE,
-                 "--field-selector=status.phase=Running",
-                 "-o", "jsonpath={.items[0].metadata.name}"],
-                capture_output=True, text=True, timeout=10
-            )
-            pod = result.stdout.strip() or None
-            if pod:
-                _cache_set("pod_name", pod)
-            return pod
-        except Exception:
-            return None
+        """The daemon pod — fixed name (StatefulSet ordinal 0, #1360).
+
+        The console SA may only touch this one pod (RBAC resourceNames), so there
+        is nothing to discover: no pods list, no label selector.
+        """
+        return DAEMON_POD
 
 
     def kexec(cmd):
@@ -233,12 +222,17 @@ data:
             lines = min(lines, 10000)  # cap at 10k
         except (ValueError, TypeError):
             return jsonify({"error": "lines must be a valid integer"}), 400
+        # #1360: by pod name, not `-l` — a label selector needs `pods list`, and
+        # the console may only read this one pod's logs.
+        pod = get_pod_name()
         try:
             result = subprocess.run(
-                ["kubectl", "logs", "--tail", str(lines),
-                 "-l", POD_LABEL, "-n", NAMESPACE, "-c", CONTAINER],
+                ["kubectl", "logs", pod, "--tail", str(lines),
+                 "-n", NAMESPACE, "-c", CONTAINER],
                 capture_output=True, text=True, timeout=15
             )
+            if result.returncode != 0:
+                return jsonify({"logs": "", "error": result.stderr.strip() or "Pod not found"})
             return jsonify({"logs": result.stdout})
         except Exception as e:
             return jsonify({"logs": "", "error": str(e)})
@@ -249,7 +243,7 @@ data:
         try:
             result = subprocess.run(
                 ["kubectl", "rollout", "restart",
-                 "deployment/%s" % DAEMON_DEPLOYMENT, "-n", NAMESPACE],
+                 "statefulset/%s" % DAEMON_STATEFULSET, "-n", NAMESPACE],
                 capture_output=True, text=True, timeout=15
             )
             return jsonify({"ok": result.returncode == 0, "message": result.stdout})
@@ -264,15 +258,15 @@ data:
     # ttyd wrapper: kubectl exec into the open-design daemon container
 
     NAMESPACE="${NAMESPACE:-open-design}"
-    LABEL="${POD_LABEL:-app=open-design}"
+    POD="${DAEMON_POD:-open-design-0}"
     CONTAINER="${DAEMON_CONTAINER:-open-design}"
 
     while true; do
-      POD=$(kubectl get pod -l "$LABEL" -n "$NAMESPACE" \
-        --field-selector=status.phase=Running \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+      # #1360: the daemon pod has a fixed name (StatefulSet ordinal 0) and the
+      # console SA may only get/exec that one pod — no namespace-wide listing.
+      PHASE=$(kubectl get pod "$POD" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null)
 
-      if [ -n "$POD" ]; then
+      if [ "$PHASE" = "Running" ]; then
         echo ""
         echo "==================================================="
         echo "  Open Design Terminal — connected to: $POD"
@@ -290,20 +284,201 @@ data:
     done
   entrypoint.py: |
     #!/usr/bin/env python3
-    """Open Design Console — entrypoint that runs Flask + ttyd side by side."""
-    import subprocess
+    """Console entrypoint — runs Flask + ttyd + the Basic-auth front side by side.
+
+    console-ttyd-exposure (AI-HER-006-4 / X-SEC-002-1): ttyd used to start as
+    `ttyd -c <user>:<admin_password>`, which put the tenant admin password into
+    /proc/<pid>/cmdline and made ttyd print `credential: <base64(user:password)>`
+    into the pod log. Now:
+      * ttyd listens on loopback only (-i lo, CONSOLE_TTYD_INTERNAL_PORT) with a
+        random per-boot credential that is NOT the admin password;
+      * the front (this file, `entrypoint.py authfront`, a supervised child) owns the
+        public port CONSOLE_TTYD_PORT (Service / NetworkPolicy / auth-proxy unchanged),
+        checks HTTP Basic against admin_password (read from the environment, never
+        from argv), and forwards the request to ttyd with ttyd's own credential;
+      * the admin password is never written to argv or to the log.
+    """
+    import asyncio
+    import base64
+    import hmac
     import os
+    import secrets
     import signal
+    import subprocess
     import sys
 
     BASIC_USER = os.environ.get("CONSOLE_BASIC_USER", "admin")
     TUI_PASSWORD = os.environ.get("TUI_PASSWORD", "")
     TTYD_PORT = os.environ.get("CONSOLE_TTYD_PORT", "7681")
+    TTYD_INTERNAL_PORT = os.environ.get("CONSOLE_TTYD_INTERNAL_PORT", "") or str(int(TTYD_PORT) + 1)
     DASHBOARD_PORT = os.environ.get("CONSOLE_DASHBOARD_PORT", "18790")
+    APP_DIR = os.environ.get("CONSOLE_APP_DIR", "/app")
     # When the auth-proxy exposes ttyd at a sub-path (console.externalPath), ttyd must
     # run with `-b <path>` so its index/asset/WS URLs are emitted under that base and
     # survive the reverse proxy. Empty → served at root (no external sub-path route).
     BASE_PATH = os.environ.get("CONSOLE_BASE_PATH", "").strip()
+
+    REALM = 'Basic realm="Console"'
+    MAX_HEAD = 16384          # request line + headers
+    MAX_BODY = 65536          # ttyd takes no request bodies; anything bigger is refused
+    IDLE_TIMEOUT = 60         # seconds to wait for a request head
+    FAIL_DELAY = 1.0          # slow down guessing that bypasses the auth-proxy lockout
+
+
+    def _reply(writer, status, extra=b""):
+        writer.write(b"HTTP/1.1 " + status + b"\r\nContent-Length: 0\r\nConnection: close\r\n" + extra + b"\r\n")
+
+
+    async def _pipe(reader, writer):
+        try:
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+    async def _relay_response(up_reader, writer):
+        """Relay ONE response, marked Connection: close, then stop: the client opens a new
+        connection (and passes the gate again) for its next request."""
+        head = await asyncio.wait_for(up_reader.readuntil(b"\r\n\r\n"), IDLE_TIMEOUT)
+        lines = head[:-4].split(b"\r\n")
+        keep = [l for l in lines[1:] if l.partition(b":")[0].strip().lower() not in (b"connection", b"keep-alive")]
+        writer.write(b"\r\n".join([lines[0]] + keep + [b"Connection: close"]) + b"\r\n\r\n")
+        status = lines[0].split(b" ")[1] if len(lines[0].split(b" ")) > 1 else b""
+        lengths = [l.partition(b":")[2].strip() for l in keep if l.partition(b":")[0].strip().lower() == b"content-length"]
+        chunked = any(l.partition(b":")[0].strip().lower() == b"transfer-encoding" for l in keep)
+        if status[:1] == b"1" or status in (b"204", b"304"):
+            remaining = 0
+        elif lengths and not chunked and lengths[0].isdigit():
+            remaining = int(lengths[0])
+        else:
+            remaining = -1   # until ttyd closes (it got Connection: close)
+        while remaining != 0:
+            data = await up_reader.read(65536 if remaining < 0 else min(65536, remaining))
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+            if remaining > 0:
+                remaining -= len(data)
+        await writer.drain()
+
+
+    def _authorized(values, expected):
+        """Exactly one Authorization header, scheme Basic, user:password == expected (constant time)."""
+        if len(values) != 1:
+            return False
+        scheme, _, token = values[0].strip().partition(b" ")
+        if scheme.lower() != b"basic":
+            return False
+        try:
+            given = base64.b64decode(token.strip(), validate=True)
+        except Exception:  # noqa: BLE001
+            return False
+        return hmac.compare_digest(given, expected)
+
+
+    async def _handle(reader, writer, expected, upstream_auth, upstream_port):
+        try:
+            try:
+                head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), IDLE_TIMEOUT)
+            except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionError):
+                return
+            except asyncio.LimitOverrunError:
+                _reply(writer, b"431 Request Header Fields Too Large")
+                return
+            lines = head[:-4].split(b"\r\n")
+            request_line, headers = lines[0], []
+            for line in lines[1:]:
+                name, sep, value = line.partition(b":")
+                if not sep or not name or name != name.strip():
+                    _reply(writer, b"400 Bad Request")
+                    return
+                headers.append((name, value.strip()))
+            lower = [(n.lower(), v) for n, v in headers]
+
+            if not _authorized([v for n, v in lower if n == b"authorization"], expected):
+                if any(n == b"authorization" for n, _ in lower):
+                    await asyncio.sleep(FAIL_DELAY)
+                _reply(writer, b"401 Unauthorized", b"WWW-Authenticate: " + REALM.encode() + b"\r\n")
+                return
+
+            if any(n == b"transfer-encoding" for n, _ in lower):
+                _reply(writer, b"400 Bad Request")
+                return
+            lengths = [v for n, v in lower if n == b"content-length"]
+            try:
+                body_len = int(lengths[0]) if lengths else 0
+            except ValueError:
+                body_len = -1
+            if len(lengths) > 1 or body_len < 0 or body_len > MAX_BODY:
+                _reply(writer, b"400 Bad Request")
+                return
+            upgrade = any(n == b"upgrade" and v.lower() == b"websocket" for n, v in lower)
+
+            # Never forward the admin credential; ttyd gets its own. A plain HTTP request
+            # is one request per connection (Connection: close), so nothing after the head
+            # this front checked can reach ttyd on the same connection.
+            drop = {b"authorization", b"proxy-authorization"}
+            if not upgrade:
+                drop |= {b"connection", b"keep-alive", b"proxy-connection", b"upgrade"}
+            out = [request_line]
+            out += [n + b": " + v for n, v in headers if n.lower() not in drop]
+            out.append(b"Authorization: " + upstream_auth)
+            if not upgrade:
+                out.append(b"Connection: close")
+            body = await reader.readexactly(body_len) if body_len else b""
+
+            try:
+                up_reader, up_writer = await asyncio.open_connection("127.0.0.1", upstream_port)
+            except OSError:
+                _reply(writer, b"502 Bad Gateway")
+                return
+            up_writer.write(b"\r\n".join(out) + b"\r\n\r\n" + body)
+            await up_writer.drain()
+            if upgrade:
+                await asyncio.gather(_pipe(reader, up_writer), _pipe(up_reader, writer))
+            else:
+                await _relay_response(up_reader, writer)
+                up_writer.close()
+        except Exception:  # noqa: BLE001 — one bad connection must never stop the front
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+    def authfront():
+        """`entrypoint.py authfront`: the public console port; credentials come from the environment."""
+        upstream = os.environ.pop("CONSOLE_UPSTREAM_CREDENTIAL", "")
+        if not TUI_PASSWORD or not upstream:
+            print("[authfront] FATAL: missing credentials — refusing to start.", flush=True)
+            sys.exit(1)
+        expected = ("%s:%s" % (BASIC_USER, TUI_PASSWORD)).encode()
+        upstream_auth = b"Basic " + base64.b64encode(upstream.encode())
+        upstream_port = int(TTYD_INTERNAL_PORT)
+
+        async def serve():
+            server = await asyncio.start_server(
+                lambda r, w: _handle(r, w, expected, upstream_auth, upstream_port),
+                host="0.0.0.0", port=int(TTYD_PORT), limit=MAX_HEAD)
+            print("[authfront] Basic gate on :%s → ttyd 127.0.0.1:%d" % (TTYD_PORT, upstream_port), flush=True)
+            async with server:
+                await server.serve_forever()
+
+        asyncio.run(serve())
+
 
     def main():
         # Fail CLOSED: never start the web terminal without a password (ttyd would
@@ -312,30 +487,41 @@ data:
             print("[entrypoint] FATAL: TUI_PASSWORD (admin_password) is empty — refusing to start.", flush=True)
             sys.exit(1)
 
-        # ttyd: web terminal that kubectl-execs into open-design pod. Basic-auth uses
-        # the SAME user as the daemon proxy (同一閘).
+        # ttyd: web terminal that kubectl-execs into the daemon pod. Loopback only, with a
+        # random per-boot credential: only the front below can reach it, and neither this
+        # argv nor ttyd's "credential:" log line carries the admin password.
+        upstream_cred = "console:" + secrets.token_urlsafe(32)
         ttyd_cmd = [
-            "ttyd", "-p", TTYD_PORT,
-            "-c", "%s:%s" % (BASIC_USER, TUI_PASSWORD),
+            "ttyd", "-i", "lo", "-p", TTYD_INTERNAL_PORT,
+            "-c", upstream_cred,
             "-W",
         ]
         if BASE_PATH:
             ttyd_cmd += ["-b", BASE_PATH]
-        ttyd_cmd += ["/app/connect.sh"]
-        ttyd_proc = subprocess.Popen(ttyd_cmd)
-        print("[entrypoint] ttyd started on :%s (PID %d)" % (TTYD_PORT, ttyd_proc.pid))
+        ttyd_cmd += [os.path.join(APP_DIR, "connect.sh")]
+        # ttyd and every terminal session (connect.sh → kubectl) never see the admin password.
+        ttyd_env = {k: v for k, v in os.environ.items() if k != "TUI_PASSWORD"}
+        ttyd_proc = subprocess.Popen(ttyd_cmd, env=ttyd_env)
+        print("[entrypoint] ttyd started on 127.0.0.1:%s (PID %d)" % (TTYD_INTERNAL_PORT, ttyd_proc.pid), flush=True)
+
+        # The front: public console port, Basic gate with the SAME user/password as the
+        # daemon proxy (同一閘). The per-boot credential goes through the environment.
+        front_env = dict(os.environ, CONSOLE_UPSTREAM_CREDENTIAL=upstream_cred)
+        front_proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "authfront"], env=front_env)
+        print("[entrypoint] console front started on :%s (PID %d)" % (TTYD_PORT, front_proc.pid), flush=True)
 
         # Flask: management dashboard
         flask_proc = subprocess.Popen(
-            [sys.executable, "/app/app.py"],
-            cwd="/app",
+            [sys.executable, os.path.join(APP_DIR, "app.py")],
+            cwd=APP_DIR,
         )
-        print("[entrypoint] Flask started on :%s (PID %d)" % (DASHBOARD_PORT, flask_proc.pid))
+        print("[entrypoint] Flask started on :%s (PID %d)" % (DASHBOARD_PORT, flask_proc.pid), flush=True)
+        children = (ttyd_proc, front_proc, flask_proc)
 
         def shutdown(sig, frame):
-            print("\n[entrypoint] Received signal %s, shutting down..." % sig)
-            ttyd_proc.terminate()
-            flask_proc.terminate()
+            print("\n[entrypoint] Received signal %s, shutting down..." % sig, flush=True)
+            for p in children:
+                p.terminate()
             sys.exit(0)
 
         signal.signal(signal.SIGTERM, shutdown)
@@ -343,12 +529,12 @@ data:
 
         # Wait for one of OUR OWN children to exit. As PID 1 this process also
         # inherits orphaned grandchildren: every ttyd session spawns
-        # /app/connect.sh, whose children are re-parented here once the user
+        # connect.sh, whose children are re-parented here once the user
         # closes the terminal tab. Reaping them is a PID-1 duty, but they must
         # NOT be mistaken for a supervised service dying — otherwise closing a
         # tab kills the whole container, and readinessProbe.initialDelaySeconds
         # then blackholes /console for ~60s on every session end.
-        supervised = {ttyd_proc.pid: "ttyd", flask_proc.pid: "Flask"}
+        supervised = {ttyd_proc.pid: "ttyd", front_proc.pid: "console front", flask_proc.pid: "Flask"}
         while True:
             try:
                 pid, status = os.waitpid(-1, 0)
@@ -362,12 +548,16 @@ data:
                   % (supervised[pid], pid, status), flush=True)
             break
 
-        ttyd_proc.terminate()
-        flask_proc.terminate()
+        for p in children:
+            p.terminate()
         sys.exit(1)
 
+
     if __name__ == "__main__":
-        main()
+        if sys.argv[1:] == ["authfront"]:
+            authfront()
+        else:
+            main()
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -488,6 +678,7 @@ data:
 
     <script>
     const TTYD_PORT = {{ .Values.console.service.ttydPort }};
+    const TTYD_BASE_PATH = {{ default "" .Values.console.externalPath | trimSuffix "/" | toJson }};
 
     function switchTab(name) {
       document.querySelectorAll('.tab').forEach((t, i) => {
@@ -501,7 +692,7 @@ data:
         if (frame.src === 'about:blank') {
           // Use same host but ttyd port
           const loc = window.location;
-          frame.src = loc.protocol + '//' + loc.hostname + ':' + TTYD_PORT;
+          frame.src = loc.protocol + '//' + loc.hostname + ':' + TTYD_PORT + TTYD_BASE_PATH + '/';
         }
       }
       if (name === 'logs') refreshLogs();

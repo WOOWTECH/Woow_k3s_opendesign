@@ -1,0 +1,11 @@
+{{- if include "woow.omnigentHost.enabled" . }}
+{{- /* Shared omnigent-host kit (supervisor, launcher, guard, helper, status printer,
+       profile hook) + its runtime ConfigMap "<name>-runtime" (server-url only, NOT
+       hashed into the pod: a serverUrl change never restarts the pod). Vendored
+       byte-identically from shared/omnigent-host by scripts/sync-omnigent-host-kit.sh.
+       Holds NO credentials: the tenant's `omnigent login` token stays on od-home. */}}
+{{- include "woow.omnigentHost.configMaps" (dict "root" . "name" (include "open-design.omnigentHostConfigMapName" .) "labels" (include "open-design.labels" . | fromYaml)) }}
+---
+# OpenDesign's own Omnigent files: the session-workspace seed (OG_WORKSPACE_SEED_DIR).
+{{ include "open-design.omnigentOdConfigMap" . }}
+{{- end }}

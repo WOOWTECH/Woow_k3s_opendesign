@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.1.0 — resync (2026-11-02)
+
+- `chart/` → **0.5.10** (was 0.2.1): Paseo, Omnigent host, built-in MCP sidecar, LLM gateway, agent defaults,
+  egress profile, hardening and the PaaS-managed console path. Source: `woow-paas/woow-paas-charts` `charts/open-design/`.
+- `image/` is now the PaaS **shell** on `open-design-core` (`Dockerfile` + `Dockerfile.core`, `od-source.env` =
+  Woow fork `woow-od-v0.24.1-w2.11`, SDK patches, MCP and Paseo runtimes, legal notices). Claude Code 2.1.296,
+  Codex 0.162.1, Pi 1.1.0, OpenCode 1.18.33, Omnigent 0.16.0. The Omnigent Pi model picker no longer shows
+  0 models when the key lives in an environment variable (w2.11).
+- `console/` follows `open-design-console/`.
+- CI: the daemon image is built on the public digest-pinned core (`OD_CORE`, `ghcr.io/woowtech/open-design-core`) because
+  the shell has no default `CORE`; three chart tests that need the woow-paas-charts layout are skipped here (they run in Gitea CI).
+- CI: yq 4.44.6 → 4.53.6 (sha256 checked against the release `checksums`); the chart's egress-profile test reads multi-document
+  `helm template` output and needs the newer `select(...) // ` semantics.
+- Sources: `woow-paas/paas-odoo-ci` and `woow-paas/woow-paas-charts` commits are in [MIRROR.md](MIRROR.md).
+
 ## 3.0.1 — resync (2026-09-30)
 
 - `chart/` → **0.2.1** (`woow-paas/woow-paas-charts` #91): the basic-auth username

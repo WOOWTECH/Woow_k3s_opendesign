@@ -1,11 +1,31 @@
 {{- if .Values.authProxy.enabled }}
 {{- $daemonPort := .Values.service.targetPort -}}
+{{- $mcp := include "open-design.mcp" . | fromYaml -}}
+{{- $paseo := include "open-design.paseo" . | fromYaml -}}
+{{- /* #1538 loopback-only route pass-through; a missing map (--reuse-values from an
+       older chart) counts as enabled. */ -}}
+{{- $lr := .Values.authProxy.localRoutes | default dict -}}
+{{- $localRoutes := ternary $lr.enabled true (hasKey $lr "enabled") -}}
+{{- /* Origins the daemon trusts (config.allowedOrigins, comma-separated), normalised
+       the way a browser sends Origin (lower case, no trailing "/"). Anything that is
+       not a plain scheme://host[:port] (e.g. "*") is left out → those requests 403. */ -}}
+{{- $localOrigins := list -}}
+{{- range splitList "," (.Values.config.allowedOrigins | default "" | toString) -}}
+{{- $o := . | trim | trimSuffix "/" | lower -}}
+{{- if regexMatch "^https?://[a-z0-9.-]+(:[0-9]{1,5})?$" $o -}}
+{{- $localOrigins = append $localOrigins $o -}}
+{{- end -}}
+{{- end -}}
 # nginx auth-proxy config (Option C). Fronts the loopback-bound daemon: serves the
 # UI at / and proxies /api/* to 127.0.0.1:<daemonPort>, gating everything with HTTP
 # basic-auth (user = authProxy.basicAuth.username, password = admin_password via the
 # .htpasswd written by the init container). /api/health,ready,version stay OPEN for
 # the kubelet + monitoring. SSE / websockets friendly. No bearer injection needed —
 # nginx reaches the daemon over loopback, which the daemon exempts from its token guard.
+# AI-FIX-SEC-1 (#1457): wrong-password lockout (429), security headers, no X-Powered-By /
+# nginx version — see templates/_authproxy-guard.tpl (shared with pi-agent / hermes-agent).
+# The three probe paths answer a caller WITHOUT credentials with a bare {"ok":true}: version,
+# platform and internal counters (AI-OD-007-3) only go to a caller that authenticates.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -21,6 +41,7 @@ data:
   # image default (pid + all temp paths under /tmp so nginx stays non-root-writable),
   # overriding only worker_processes / worker_connections.
   nginx.conf: |
+    {{- include "woow.authguard.main" . | nindent 4 }}
     worker_processes {{ .Values.authProxy.workerProcesses | default 2 }};
     error_log  /var/log/nginx/error.log notice;
     pid        /tmp/nginx.pid;
@@ -30,6 +51,9 @@ data:
     }
 
     http {
+      # The origin map includes the method prefix and a full DNS host. Keep
+      # valid long public origins within one hash bucket (nginx default: 64).
+      map_hash_bucket_size 512;
       proxy_temp_path /tmp/proxy_temp;
       client_body_temp_path /tmp/client_temp;
       fastcgi_temp_path /tmp/fastcgi_temp;
@@ -39,10 +63,27 @@ data:
       include       /etc/nginx/mime.types;
       default_type  application/octet-stream;
 
-      log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
-                        '$status $body_bytes_sent "$http_referer" '
+      # sensitive-data-in-logs (商用驗收 X-SEC-002, 0.5.4): no query string, no MCP token in
+      # the access log. "$request" / "$http_referer" carried `?token=…` (a client that puts
+      # the /mcp token in the URL had it logged). $woow_log_path = the original request path
+      # (not $uri: the probe rewrite would log /_woow/probe) with the query cut off and a
+      # /private_<token> segment masked (a near-miss like /private_<token>/mcp/ falls through
+      # to `location /` and would be logged with the token). The Referer keeps only the part
+      # before "?". First matching regex wins.
+      map $request_uri $woow_log_path {
+        default                                                $request_uri;
+        "~^/private_[^/?]*(?<woow_priv_rest>/[^?]*)?"           /private_<redacted>$woow_priv_rest;
+        "~^(?<woow_path_noargs>[^?]*)"                          $woow_path_noargs;
+      }
+      map $http_referer $woow_log_referer {
+        default                            $http_referer;
+        "~^(?<woow_ref_noargs>[^?#]*)[?#]" $woow_ref_noargs;
+      }
+      log_format  main  '$remote_addr - $remote_user [$time_local] "$request_method $woow_log_path $server_protocol" '
+                        '$status $body_bytes_sent "$woow_log_referer" '
                         '"$http_user_agent" "$http_x_forwarded_for"';
       access_log  /var/log/nginx/access.log  main;
+      {{- include "woow.authguard.http" . | nindent 6 }}
 
       sendfile        on;
       keepalive_timeout  65;
@@ -55,21 +96,142 @@ data:
       ''      close;
     }
 
+    # #1517: forward the client's Host header VERBATIM (host[:port]). nginx's $host
+    # drops the port, and the daemon matches Host against config.allowedOrigins, so a
+    # URL with a non-default port (e.g. http://127.0.0.1:18042, a custom domain on a
+    # non-standard port) got 403 on /api/app-config — the web UI then PUT an empty
+    # config back and wiped the default agent. On the platform's https URL (no port)
+    # $http_host == $host, so nothing changes there. $host stays only as the fallback
+    # for a request without a Host header (HTTP/1.0), so the daemon never sees an
+    # empty Host.
+    map $http_host $od_upstream_host {
+      default $http_host;
+      ''      $host;
+    }
+    {{- if $localRoutes }}
+
+    # #1538: the daemon guards ~30 routes with requireLocalDaemonRequest (desktop-app
+    # design): the TCP peer, the Host header AND any Origin header must all be loopback.
+    # nginx reaches the daemon over 127.0.0.1 (peer passes) but forwards the public Host,
+    # so through the platform URL every one of them was 403 (Remix silently became an
+    # empty project, live-artifact preview blank, diagnostics export / Composio key /
+    # Design Harness / library / memory connectors all broken). The location below
+    # rewrites Host to the daemon's loopback address and drops Origin for exactly those
+    # routes. Dropping Origin also drops the daemon's CSRF check, so nginx does it
+    # first: no Origin (same-origin GET, CLI) or an Origin listed in
+    # config.allowedOrigins passes, anything else (another site, "null") is 403 —
+    # the same verdict the daemon's /api origin middleware gives every other route.
+    # Basic auth stays in front, as on /.
+    map $http_origin $od_local_route_origin_ok {
+      default 0;
+      ''      1;
+      {{- range $localOrigins }}
+      {{ . | quote }} 1;
+      {{- end }}
+    }
+    {{- end }}
+
+    # AI-OD-007-3: no Authorization header = a kubelet probe or a monitor; it gets a bare
+    # status, not the daemon's JSON (version, platform, internal counters).
+    map $http_authorization $od_probe_anon {
+      default 0;
+      ''      1;
+    }
+    {{- if $paseo.enabled }}
+
+    # Retain Origin for the app's own guard. Empty Origin is accepted for reads
+    # only; authenticated cross-site mutations cannot reach the loopback app.
+    map $request_method $od_paseo_read_method {
+      default 0;
+      GET 1;
+      HEAD 1;
+    }
+    map "$od_paseo_read_method:$http_origin" $od_paseo_origin_ok {
+      default 0;
+      "1:" 1;
+      {{ printf "0:%s" (include "open-design.paseoOrigin" .) | quote }} 1;
+      {{ printf "1:%s" (include "open-design.paseoOrigin" .) | quote }} 1;
+    }
+    {{- end }}
+
     server {
       listen {{ .Values.authProxy.port }};
       server_name _;
+      {{- include "woow.authguard.server" . | nindent 6 }}
 
       client_max_body_size 100m;
+
+      # PLAT-01: tell Cloudflare (and any other proxy on the way) not to transform
+      # responses. Without it, Cloudflare's Email Obfuscation / JS detection rewrite
+      # the HTML (e-mail addresses become "[email protected]" + an injected decoder
+      # script), which then ends up in exported standalone HTML / ZIP files and
+      # breaks them offline. `always` = also on 4xx/5xx and the local stubs; no
+      # location below sets its own add_header, so every location inherits this.
+      add_header Cache-Control "no-transform" always;
 
       # nginx-LOCAL liveness stub — returns 200 without touching the daemon, so the
       # sidecar's livenessProbe reflects nginx health only (a daemon outage must not
       # restart this container).
       location = /healthz { auth_basic off; access_log off; return 200 "ok\n"; }
 
-      # Probes — OPEN (no basic-auth) so the kubelet and monitoring can reach them.
-      location = /api/health  { auth_basic off; proxy_pass http://127.0.0.1:{{ $daemonPort }}; }
-      location = /api/ready   { auth_basic off; proxy_pass http://127.0.0.1:{{ $daemonPort }}; }
-      location = /api/version { auth_basic off; proxy_pass http://127.0.0.1:{{ $daemonPort }}; }
+      # Probes — OPEN to a caller without credentials (the kubelet and monitoring), who gets
+      # only {"ok":true} when the daemon answers 2xx on /api/health (daemon down -> 500, so
+      # readiness behaves as before). A caller WITH an Authorization header is checked like
+      # any other and, if the credentials are right, gets the daemon's full answer (the
+      # OD MCP health check reads `version` from it).
+      location = /api/health {
+        if ($od_probe_anon) { rewrite ^ /_woow/probe last; }
+        {{- if .Values.authProxy.basicAuth.enabled }}
+        auth_basic "Open Design";
+        auth_basic_user_file /etc/nginx/auth/.htpasswd;
+        {{- include "woow.authguard.verified" . | nindent 8 }}
+        {{- else }}
+        auth_basic off;
+        {{- end }}
+        proxy_pass http://127.0.0.1:{{ $daemonPort }};
+      }
+      location = /api/ready {
+        if ($od_probe_anon) { rewrite ^ /_woow/probe last; }
+        {{- if .Values.authProxy.basicAuth.enabled }}
+        auth_basic "Open Design";
+        auth_basic_user_file /etc/nginx/auth/.htpasswd;
+        {{- include "woow.authguard.verified" . | nindent 8 }}
+        {{- else }}
+        auth_basic off;
+        {{- end }}
+        proxy_pass http://127.0.0.1:{{ $daemonPort }};
+      }
+      location = /api/version {
+        if ($od_probe_anon) { rewrite ^ /_woow/probe last; }
+        {{- if .Values.authProxy.basicAuth.enabled }}
+        auth_basic "Open Design";
+        auth_basic_user_file /etc/nginx/auth/.htpasswd;
+        {{- include "woow.authguard.verified" . | nindent 8 }}
+        {{- else }}
+        auth_basic off;
+        {{- end }}
+        proxy_pass http://127.0.0.1:{{ $daemonPort }};
+      }
+      # NB: `return` runs in the rewrite phase, BEFORE auth_request (access phase) — it would
+      # answer 200 without probing the daemon. try_files runs after the access phase, so the
+      # probe gates the answer; the named location is only reached when it passed.
+      location = /_woow/probe {
+        internal;
+        auth_basic off;
+        auth_request /_woow/probe-daemon;
+        try_files /_woow_none @od_probe_ok;
+      }
+      location @od_probe_ok {
+        auth_basic off;
+        default_type application/json;
+        return 200 '{"ok":true}\n';
+      }
+      location = /_woow/probe-daemon {
+        internal;
+        proxy_pass http://127.0.0.1:{{ $daemonPort }}/api/health;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+      }
 
       {{- if and .Values.console.enabled .Values.console.externalPath }}
       # Console web terminal (ttyd) — proxied to the console pod so a tenant reaches
@@ -88,9 +250,11 @@ data:
       }
       location {{ .Values.console.externalPath }}/ {
         auth_basic off;
+        # ttyd enforces its own Basic gate on every path: a < 400 answer to a Basic header means it accepted it
+        {{- include "woow.authguard.verified" . | nindent 8 }}
         proxy_pass http://{{ include "open-design.console.fullname" . }}:{{ .Values.console.service.ttydPort }};
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        proxy_set_header Host $od_upstream_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -101,6 +265,155 @@ data:
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
       }
+      {{- if ne .Values.console.externalPath "/terminal" }}
+      # The Home Assistant build of the same image served its terminal at /terminal/
+      # before both moved to /console/; the path behaves the same on both builds.
+      # A plain relative redirect, nothing behind it → no basic-auth prompt for it.
+      location = /terminal {
+        auth_basic off;
+        absolute_redirect off;
+        return 301 {{ .Values.console.externalPath }}/;
+      }
+      location ^~ /terminal/ {
+        auth_basic off;
+        absolute_redirect off;
+        return 301 {{ .Values.console.externalPath }}/;
+      }
+      {{- end }}
+      {{- end }}
+
+      {{- if $mcp.enabled }}
+
+      # Built-in OpenDesign MCP server (0.5.0, the `mcp` container on 127.0.0.1:{{ $mcp.port }}).
+      # Token auth is the gateway's own — Bearer on /mcp, the token as a path secret on
+      # /private_<token>/mcp (Claude.ai custom connectors cannot send headers) — so
+      # basic-auth is OFF on these two. Agent runs (create_project / send_message) are
+      # one long streamed reply: no buffering, timeouts above the gateway's own bounds.
+      location = /mcp {
+        auth_basic off;
+        # Logged (path only, see log_format main), but nginx's error log would add the raw
+        # request line — `?token=…` included — on every upstream error; the mcp container
+        # logs its own errors.
+        error_log /dev/null;
+        proxy_pass http://127.0.0.1:{{ $mcp.port }};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_read_timeout 360s;
+        proxy_send_timeout 360s;
+      }
+      # The path IS the credential: it must never reach a log line (platform #1614).
+      # Quoted: an unquoted "{" in a regex would end nginx's location token.
+      location ~ "^/private_[A-Za-z0-9_-]{1,128}/mcp$" {
+        auth_basic off;
+        access_log off;
+        # …nor an error-log line: on an upstream error nginx prints the raw request line.
+        error_log /dev/null;
+        proxy_pass http://127.0.0.1:{{ $mcp.port }};
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_read_timeout 360s;
+        proxy_send_timeout 360s;
+      }
+      # Management page (show / rotate / revoke the MCP token, tool switches): the same
+      # basic-auth as the UI. nginx is the only identity source: X-Remote-User-Id = the
+      # basic-auth user (a client-sent value is overwritten); the admin app also requires
+      # its CSRF token for every change. admin.sock lives in an emptyDir that only this
+      # container and the mcp container mount.
+      location = /mcp-admin {
+        {{- if .Values.authProxy.basicAuth.enabled }}
+        auth_basic "Open Design";
+        auth_basic_user_file /etc/nginx/auth/.htpasswd;
+        {{- end }}
+        absolute_redirect off;
+        return 301 /mcp-admin/;
+      }
+      location ^~ /mcp-admin/ {
+        {{- if .Values.authProxy.basicAuth.enabled }}
+        auth_basic "Open Design";
+        auth_basic_user_file /etc/nginx/auth/.htpasswd;
+        {{- include "woow.authguard.verified" . | nindent 8 }}
+        {{- end }}
+        proxy_pass http://unix:/run/od-mcp/admin.sock:/;
+        proxy_http_version 1.1;
+        proxy_set_header Host localhost;
+        proxy_set_header Connection "";
+        proxy_set_header Origin "";
+        proxy_set_header X-Remote-User-Id $remote_user;
+        proxy_set_header X-Ingress-Path /mcp-admin;
+        proxy_set_header Accept-Encoding "";
+        proxy_read_timeout 60s;
+      }
+      {{- end }}
+
+      {{- if $paseo.enabled }}
+      # Standalone app, same container as OD; never route its internal /healthz.
+      location = /paseo/setup {
+        {{- include "open-design.paseoProxy" . | nindent 8 }}
+      }
+      location = /paseo/setup/ {
+        {{- include "open-design.paseoProxy" . | nindent 8 }}
+      }
+      location ^~ /paseo/assets/ {
+        {{- include "open-design.paseoProxy" . | nindent 8 }}
+      }
+      location = /api/paseo-bridge {
+        {{- include "open-design.paseoProxy" . | nindent 8 }}
+      }
+      {{- end }}
+
+      # White label (#1439): the image's "Contact us" dialog and the leftover community
+      # links point at this same-origin path; it answers with the WoowTech support page
+      # (whiteLabel.supportUrl), so the target changes without a new image. A plain
+      # redirect, nothing behind it → no basic-auth prompt for it.
+      location = /_woow/support {
+        auth_basic off;
+        return 302 "{{ include "open-design.supportUrl" . }}";
+      }
+
+      {{- if $localRoutes }}
+
+      # #1538: destructive daemon maintenance (desktop/CLI only, no web UI entry) is
+      # never proxied — not even for a caller that forges a loopback Host itself.
+      location ~ ^/api/daemon/(?:shutdown|db/vacuum)$ {
+        return 403;
+      }
+
+      # #1538: loopback-only daemon routes that the web UI calls (live-artifact preview
+      # and refresh, plugin Remix / duplicate-project, Composio connector config and
+      # authorization, diagnostics export, Design Harness rollout, library pairing /
+      # sync / asset actions, memory connector suggest / extract, agent companion
+      # install). Same gate as /, plus the Origin check (map above); the daemon sees
+      # Host 127.0.0.1:<port> and no Origin. 127.0.0.1, not "localhost": with the
+      # loopback bind the daemon treats Host localhost:<port> as its powered-preview
+      # origin and refuses ordinary API routes there. The Composio OAuth callback URL
+      # is still built from this loopback Host (upstream), so OAuth-type connectors
+      # cannot finish in a remote browser; API-key connectors work.
+      location ~ ^/api/(?:live-artifacts/[^/]+/(?:preview|refresh)|plugins/[^/]+/duplicate-project|connectors/(?:composio/config|auth-configs/prepare|[^/]+/(?:connect|authorization/cancel|connection))|diagnostics/(?:export|chat-scroll-forensics)|strategies/od-next/rollout|library/(?:pair|connection|sync|assets/[^/]+(?:/apply|/edit-as-page)?)|memory/connectors/(?:suggest|extract)|agents/[^/]+/(?:companion/install|oauth-launch))$ {
+        {{- if .Values.authProxy.basicAuth.enabled }}
+        auth_basic "Open Design";
+        auth_basic_user_file /etc/nginx/auth/.htpasswd;
+        {{- include "woow.authguard.verified" . | nindent 8 }}
+        {{- else }}
+        auth_basic off;
+        {{- end }}
+        if ($od_local_route_origin_ok = 0) {
+          return 403;
+        }
+        proxy_pass http://127.0.0.1:{{ $daemonPort }};
+        proxy_http_version 1.1;
+        proxy_set_header Host 127.0.0.1:{{ $daemonPort }};
+        proxy_set_header Origin "";
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+      }
       {{- end }}
 
       # UI + API — gated by basic-auth (the tenant credential). /api/* falls under
@@ -109,12 +422,13 @@ data:
         {{- if .Values.authProxy.basicAuth.enabled }}
         auth_basic "Open Design";
         auth_basic_user_file /etc/nginx/auth/.htpasswd;
+        {{- include "woow.authguard.verified" . | nindent 8 }}
         {{- else }}
         auth_basic off;
         {{- end }}
         proxy_pass http://127.0.0.1:{{ $daemonPort }};
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        proxy_set_header Host $od_upstream_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -126,4 +440,6 @@ data:
         proxy_send_timeout 600s;
       }
     }
+  authguard.js: |
+    {{- include "woow.authguard.js" . | nindent 4 }}
 {{- end }}

@@ -20,10 +20,15 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # The daemon image (image/Dockerfile) is the PaaS shell and has no default CORE on purpose. CI builds it on the
+  # same public, digest-pinned core the Home Assistant add-on ships (open-design-core is copied to GHCR by digest).
+  # Bump this together with every resync: the current core is TEST_CORE in woow-paas/paas-odoo-ci
+  # .gitea/workflows/test-open-design-mcp.yml (same tag and digest, registry ghcr.io/woowtech).
+  OD_CORE: ghcr.io/woowtech/open-design-core:20261101.2319@sha256:a3d1e6ce84774d11e03a31b379be438b5f53fe832ddd4b72d31fc837462bbd62
   HELM_VERSION: 3.19.5
   HELM_SHA256: a0a5e8c592ed3f376ac110715eff214730c7422f9a44d96cf98117d2b8b0e6c0
-  YQ_VERSION: 4.44.6
-  YQ_SHA256: 0c2b24e645b57d8e7c0566d18643a6d4f5580feeea3878127354a46f2a1e4598
+  YQ_VERSION: 4.53.6
+  YQ_SHA256: c5f056448f973ae7d39b5401949648a78f2dc1947d6a8eb65be60d5c504b9385
 
 jobs:
   chart:
@@ -51,7 +56,12 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          # Three tests read files outside the chart directory (../../shared/..., or `git archive` of an
+          # older revision of woow-paas-charts). They need that repository's layout and history, which
+          # this mirror does not have, so they run in Gitea CI only.
+          skip=" test-console-credential.sh test-omnigent-host-kit.sh test-paseo.sh "
           for t in chart/tests/*.sh; do
+            case "$skip" in *" $(basename "$t") "*) echo "skip $t (needs the woow-paas-charts layout; runs in Gitea CI)"; continue ;; esac
             echo "::group::$t"
             bash "$t"
             echo "::endgroup::"
@@ -66,8 +76,10 @@ jobs:
         include:
           - name: daemon
             context: image
+            core: true
           - name: console
             context: console
+            core: false
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
@@ -77,6 +89,7 @@ jobs:
       - uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: ${{ matrix.context }}
+          build-args: ${{ matrix.core && format('CORE={0}', env.OD_CORE) || '' }}
           platforms: linux/amd64
           push: false
           tags: woow-open-design-${{ matrix.name }}:ci

@@ -3,8 +3,9 @@
 # NetworkPolicy contract (aligned with mcp-server #279/#280):
 #   - default-deny (Ingress+Egress) NP present, selecting the whole release
 #   - daemon-allow NP present; egress DNS + allowAllEgress toggle
-#   - ingressNamespaces EMPTY (default) → NO from-less ingress allow rule (the #280
-#     hole); operator baseline governs CS-ns ingress
+#   - ingressNamespaces EMPTY (default) → the only ingress rule is "this namespace,
+#     every port" (workspace = LAN, #1441) — never a from-less #280 hole
+#   - both allow policies reach / are reached by the whole namespace (#1441)
 #   - ingressNamespaces set → a proper namespaceSelector `from:` rule on :7457
 #   - console-allow NP present only when console.enabled
 #
@@ -26,8 +27,15 @@ DDI="$(printf '%s' "$DD" | yq '.spec.policyTypes | length')"
 # empty ingressNamespaces (default) → daemon-allow ingress has NO rules (null/empty).
 ALLOW="$(printf '%s' "$OUT" | yq 'select(.kind=="NetworkPolicy" and .metadata.name=="t-open-design-allow")')"
 [ -n "$ALLOW" ] || fail "no daemon-allow NetworkPolicy rendered"
-NRULES="$(printf '%s' "$ALLOW" | yq '.spec.ingress // [] | length')"
-[ "$NRULES" = "0" ] || fail "daemon-allow has $NRULES from-less ingress rule(s) by default — expected 0 (#280 hole guard)"
+[ "$(yq -o=json -I=0 '.spec.ingress' <<<"$ALLOW")" = '[{"from":[{"podSelector":{}}]}]' ] || fail "daemon-allow ingress by default must be the same namespace only (#280 hole guard / #1441)"
+CALLOW="$(printf '%s' "$OUT" | yq 'select(.kind=="NetworkPolicy" and .metadata.name=="t-open-design-console-allow")')"
+for NP in "$ALLOW" "$CALLOW"; do
+  grep -qxF '{"to":[{"podSelector":{}}]}' <<<"$(yq -o=json -I=0 '.spec.egress[]' <<<"$NP")" || fail "same-namespace egress (every pod, every port) missing (#1441)"
+  grep -qxF '{"from":[{"podSelector":{}}]}' <<<"$(yq -o=json -I=0 '.spec.ingress[]' <<<"$NP")" || fail "same-namespace ingress (every pod, every port) missing (#1441)"
+done
+for excl in 224.0.0.0/4 240.0.0.0/4; do
+  grep -qx "$excl" <<<"$(yq '.spec.egress[].to[]?.ipBlock.except[]?' <<<"$ALLOW")" || fail "internet egress must exclude $excl (#1441)"
+done
 
 # ── Egress converged (np-audit #42 F-1/2/3/7) — NEVER a bare `- {}` allow-all ──
 # No open `- {}` egress rule anywhere, in ANY scenario (the root F-1 defect).
@@ -58,20 +66,24 @@ OFFA="$($HELM template t "$CHART_DIR" --set networkPolicy.allowAllEgress=false 2
   | yq 'select(.kind=="NetworkPolicy" and .metadata.name=="t-open-design-allow")')"
 OFFNET="$(printf '%s' "$OFFA" | yq '[.spec.egress[] | select(.to[0].ipBlock.cidr == "0.0.0.0/0")] | length')"
 [ "$OFFNET" = "0" ] || fail "allowAllEgress=false daemon still exposes internet ipBlock egress (expected DNS + optional in-cluster console only)"
-# and with the console route also off, egress is DNS-only (single rule).
-OFFE="$($HELM template t "$CHART_DIR" --set networkPolicy.allowAllEgress=false --set console.externalPath="" 2>/dev/null \
+# and with the console route and the in-namespace Omnigent hole also off, egress is
+# DNS + this namespace (workspace = LAN, #1441); also sameNamespaceEgress=false → DNS-only.
+OFFE="$($HELM template t "$CHART_DIR" --set networkPolicy.allowAllEgress=false --set console.externalPath="" --set networkPolicy.omnigentEgress.enabled=false 2>/dev/null \
   | yq 'select(.kind=="NetworkPolicy" and .metadata.name=="t-open-design-allow") | .spec.egress | length')"
-[ "$OFFE" = "1" ] || fail "allowAllEgress=false + no console route → daemon egress count='$OFFE', expected 1 (DNS only)"
+[ "$OFFE" = "2" ] || fail "allowAllEgress=false + no console route + no omnigent egress → daemon egress count='$OFFE', expected 2 (DNS + same namespace)"
+OFFE1="$($HELM template t "$CHART_DIR" --set networkPolicy.allowAllEgress=false --set console.externalPath="" --set networkPolicy.omnigentEgress.enabled=false --set networkPolicy.sameNamespaceEgress=false 2>/dev/null \
+  | yq 'select(.kind=="NetworkPolicy" and .metadata.name=="t-open-design-allow") | .spec.egress | length')"
+[ "$OFFE1" = "1" ] || fail "… + sameNamespaceEgress=false → daemon egress count='$OFFE1', expected 1 (DNS only)"
 
 # console egress = DNS + explicit apiserver ipBlock (NOT allow-all), no internet in baked mode.
 CALLOW="$(printf '%s' "$OUT" | yq 'select(.kind=="NetworkPolicy" and .metadata.name=="t-open-design-console-allow")')"
 CAPI="$(printf '%s' "$CALLOW" | yq '.spec.egress[] | select(.to[0].ipBlock.cidr == "10.43.0.1/32") | .to[0].ipBlock.cidr')"
 [ "$CAPI" = "10.43.0.1/32" ] || fail "console egress missing explicit apiserver ipBlock (10.43.0.1/32)"
 CEGN="$(printf '%s' "$CALLOW" | yq '.spec.egress | length')"
-[ "$CEGN" = "2" ] || fail "console egress count='$CEGN', expected 2 (DNS + apiserver, no internet in baked mode)"
+[ "$CEGN" = "3" ] || fail "console egress count='$CEGN', expected 3 (DNS + apiserver + same namespace, no internet in baked mode)"
 CEGRT="$($HELM template t "$CHART_DIR" --set console.runtimeInstall=true 2>/dev/null \
   | yq 'select(.kind=="NetworkPolicy" and .metadata.name=="t-open-design-console-allow") | .spec.egress | length')"
-[ "$CEGRT" = "3" ] || fail "console runtimeInstall egress count='$CEGRT', expected 3 (DNS + apiserver + internet)"
+[ "$CEGRT" = "4" ] || fail "console runtimeInstall egress count='$CEGRT', expected 4 (DNS + apiserver + same namespace + internet)"
 
 # ingressNamespaces set → proper from rule on the auth-proxy port (8080, Option C:
 # external ingress lands on the proxy, not the loopback daemon).
@@ -90,4 +102,4 @@ CNPOFF="$($HELM template t "$CHART_DIR" --set console.enabled=false 2>/dev/null 
   | yq 'select(.kind=="NetworkPolicy" and .metadata.name=="t-open-design-console-allow") | .metadata.name')"
 [ -z "$CNPOFF" ] || fail "console-allow NP rendered even with console.enabled=false"
 
-echo "PASS (networkpolicy): default-deny, no from-less ingress, NO bare-{} egress, ipBlock excludes cluster+metadata, apiserver-scoped console, kube-dns DNS, console NP gated."
+echo "PASS (networkpolicy): default-deny, no from-less ingress (same namespace only), workspace = LAN, NO bare-{} egress, ipBlock excludes cluster+metadata, apiserver-scoped console, kube-dns DNS, console NP gated."
