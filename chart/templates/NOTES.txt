@@ -49,6 +49,9 @@ Auth (Option C — tenant gate = HTTP basic-auth via the auth-proxy):
 {{- end }}
 {{- if not .Values.auth.anthropicApiKey }}
     ANTHROPIC_API_KEY not set → `claude login` interactively via the console TUI (persisted on the od-home PVC).
+{{- if .Values.auth.openrouterApiKey }}
+    Default agent: OpenCode with {{ include "open-design.opencodeModel" . | default "OpenCode's own default model" }} (agentDefaults.*), until Claude can run.
+{{- end }}
 {{- end }}
 
 {{- if .Values.console.enabled }}
@@ -68,6 +71,55 @@ Console (dashboard + web terminal):
 {{- else }}
 
 Console: disabled (console.enabled=false) — daemon only.
+{{- end }}
+
+{{- if include "woow.omnigentHost.enabled" . }}
+
+Omnigent host (inside the daemon container, omnigentHost.enabled):
+    Idle until the tenant logs in. In the console terminal ({{ if .Values.console.externalPath }}<OpenDesign URL>{{ .Values.console.externalPath }}/{{ else }}console{{ end }}) run:
+      {{ with include "woow.omnigentHost.serverUrl" . }}omnigent login {{ . }}{{ else }}omnigent login http://<omnigent-release>-omnigent.{{ .Release.Namespace }}.svc.cluster.local:8000{{ end }}
+    (WOOW default account: the Omnigent admin, owner of the hosts; at the
+    "Username [admin]" prompt type the account you mean.)
+    ACCEPTED RISK: the login's refresh grant (Omnigent admin by WOOW default, valid up to
+    the Omnigent grantMaxLifetimeDays) is stored in ~/.omnigent/auth_tokens.json on od-home.
+    Omnigent sessions AND OpenDesign's own agent runs run as the same user and can read it,
+    so anyone who can drive this OpenDesign (or content injected into a design) can act as
+    that Omnigent account. Log in with a dedicated account to limit this; to revoke, disable
+    the account in Omnigent (deleting the file is only a local logout).
+    The host then appears in Omnigent as "{{ include "woow.omnigentHost.hostName" . }}" and
+    reconnects by itself after restarts (a second manual `omnigent host` is refused).
+    Open sessions with workspace {{ include "open-design.omnigentWorkspace" . }} (Claude harness).
+    The console terminal prints what to do whenever the tenant has to act (login
+    expired, account switched → `omnigent host reset-id --yes`, …); full status:
+      omnigent-host-status
+    Supervisor log (next to the daemon's): kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "open-design.fullname" . }} -c {{ .Chart.Name }}
+{{- end }}
+{{- $llm := include "open-design.llmGatewayBaseUrl" . }}
+{{- $llmRaw := include "open-design.llmGatewayRawBaseUrl" . }}
+{{- if $llm }}
+
+同工作區 LiteLLM（llmGateway.baseUrl）：daemon 容器（/console/ 終端機、Omnigent session 同）有 env LITELLM_BASE_URL={{ $llm }}
+    （OpenAI 相容 base URL；容器啟動時讀取，改網址後下次重啟才生效）。平台不傳金鑰：
+    在 LiteLLM 後台自建虛擬金鑰，貼到要用的工具自己的設定。
+    Egress：daemon → 同 ns LiteLLM proxy pod（name=litellm, component=app）TCP 4000（networkPolicy.litellmEgress）。
+{{- with include "open-design.llmGatewayAllowedInternalHosts" . }}
+    SSRF 白名單：OD_ALLOWED_INTERNAL_HOSTS={{ . }}——在 OpenDesign 設定頁「API 供應商」填上面這個網址
+    （原樣，同一個 FQDN）才不會被擋成「Internal IPs blocked」；同樣下次重啟才生效。
+{{- end }}
+{{- else if $llmRaw }}
+
+同工作區 LiteLLM：llmGateway.baseUrl {{ $llmRaw | quote }} 不是 http(s) 網址，已略過（沒有 LITELLM_BASE_URL、沒有 egress 洞）。
+{{- end }}
+
+{{- $mcp := include "open-design.mcp" . | fromYaml }}
+{{- if $mcp.enabled }}
+
+內建 OpenDesign MCP server（mcp sidecar，127.0.0.1:{{ $mcp.port }}）：
+    Claude Code／Claude Desktop／其他代理：<服務網址>/mcp，header Authorization: Bearer <MCP 金鑰>
+    Claude.ai 自訂連接器：<服務網址>/private_<MCP 金鑰>/mcp
+    MCP 金鑰與工具開關：<服務網址>/mcp-admin/（同一組帳號密碼）
+    ⚠ 對這個主機名稱開 Cloudflare Access 會擋住外部 MCP（Claude.ai 尤其）：不要開，或為 /mcp 與 /private_*/mcp 設例外。
+    ⚠ 15 支工具預設全開：沒有設定 AI 金鑰時，經 MCP 指定 opencode 的 create_project／send_message 仍可能呼叫外部模型、產生外部用量。
 {{- end }}
 
 NOTE: PVC reclaim depends on this release living in a paas-ws-* namespace and

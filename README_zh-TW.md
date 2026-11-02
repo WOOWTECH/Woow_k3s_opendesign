@@ -22,12 +22,14 @@
 
 | 元件 | 版本 |
 |---|---|
-| OpenDesign | **0.24.1**（以上游官方預建 image `ghcr.io/nexu-io/od` 為基底，digest 釘死） |
-| Claude Code | **2.1.284** |
+| OpenDesign | **0.24.1**（從 Woow fork `woow-od-v0.24.1-w2.11` 建出的 `open-design-core`，PaaS 外殼疊在上面；digest 釘死） |
+| Claude Code | **2.1.296** |
+| Codex | **0.162.1** |
+| Pi | **1.1.0** |
 | OpenCode | **1.18.33** |
-| Chart | **0.2.1** |
+| Chart | **0.5.10** |
 
-`image/Dockerfile` 最後一步是 build 時的檢查：Claude Code 與 OpenCode 版本必須完全相符、
+核心（`image/Dockerfile.core`）最後一步是 build 時的檢查：Claude Code、Codex、Pi 與 OpenCode 版本必須完全相符、
 所有工具都要在 PATH 上，任何一項不符 build 就會失敗，不會產出有問題的 image。
 
 ## 在 PaaS 上怎麼運作

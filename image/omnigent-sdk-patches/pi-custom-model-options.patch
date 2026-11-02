@@ -1,0 +1,109 @@
+diff --git a/omnigent/harnesses/pi_native/credentials.py b/omnigent/harnesses/pi_native/credentials.py
+index f06a5891e..84e850a13 100644
+--- a/omnigent/harnesses/pi_native/credentials.py
++++ b/omnigent/harnesses/pi_native/credentials.py
+@@ -450,7 +450,11 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str,
+     When no omnigent-managed provider is configured, the launched Pi runs on
+     its own credentials, so the pre-launch picker must offer the models that
+     login can actually drive: Pi's ``models-store.json`` catalog filtered to
+-    providers with an ``auth.json`` entry.
++    providers with an ``auth.json`` entry, plus custom ``models.json`` providers
++    that have an API key in that file or an ``auth.json`` entry. When those
++    files name no usable provider -- its key comes from an environment
++    variable, or ``models.json`` only overrides a built-in provider -- ask the
++    installed Pi CLI, which already knows what it can run.
+ 
+     :param agent_dir: Pi agent dir override (tests); defaults to the host's
+         own Pi agent dir.
+@@ -460,8 +464,6 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str,
+     """
+     root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
+     logged_in = set(_read_json_object(root / "auth.json"))
+-    if not logged_in:
+-        return []
+     options: dict[str, dict[str, object]] = {}
+     for provider_id, payload in _read_json_object(root / "models-store.json").items():
+         if provider_id not in logged_in or not _is_str_object_dict(payload):
+@@ -480,6 +482,82 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str,
+                 "model": qualified,
+                 "displayName": name if isinstance(name, str) and name else model_id,
+             }
++    custom = _read_json_object(root / "models.json").get("providers")
++    for provider_id, payload in custom.items() if _is_str_object_dict(custom) else []:
++        if not isinstance(provider_id, str) or not provider_id or not _is_str_object_dict(payload):
++            continue
++        api_key = payload.get("apiKey")
++        if provider_id not in logged_in and not (isinstance(api_key, str) and api_key.strip()):
++            continue
++        models = payload.get("models")
++        for model in models if isinstance(models, list) else []:
++            if not _is_str_object_dict(model):
++                continue
++            model_id = model.get("id")
++            if not isinstance(model_id, str) or not model_id:
++                continue
++            qualified = f"{provider_id}/{model_id}"
++            name = model.get("name")
++            options[qualified] = {
++                "id": qualified,
++                "model": qualified,
++                "displayName": name if isinstance(name, str) and name else model_id,
++            }
++    if not options:
++        return _ambient_pi_model_options(agent_dir)
++    return [options[model_id] for model_id in sorted(options)]
++
++
++_PI_PROVIDER_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
++
++
++def _ambient_pi_model_options(agent_dir: Path | None = None) -> list[dict[str, object]]:
++    """List the models Pi itself reports, without launching a session.
++
++    Pi reads providers from places this module does not model: an API key in
++    the environment (``OPENROUTER_API_KEY`` and friends), or a built-in
++    provider that ``models.json`` merely overrides. ``pi --list-models`` already
++    resolves all of that, so the picker asks it when the files came up empty.
++    The file-based answer still wins whenever it is non-empty.
++
++    Total by contract: a missing CLI, a failure, a timeout, or output that is
++    not Pi's model table yields ``[]`` and never raises. With nothing
++    configured Pi prints a "No models available" notice instead of a table, so
++    only lines after the ``provider  model ...`` header are read as models.
++
++    :param agent_dir: Pi agent dir override (tests); defaults to the host's own.
++    """
++    env = None if agent_dir is None else {**os.environ, PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
++    try:
++        result = subprocess.run(
++            ["pi", "--list-models"],
++            capture_output=True,
++            text=True,
++            errors="replace",
++            # About a second where measured; the host RPC that asks is cut off at
++            # fifteen seconds, so stay clear of that.
++            timeout=12,
++            check=False,
++            stdin=subprocess.DEVNULL,
++            env=env,
++        )
++    except (OSError, subprocess.SubprocessError):
++        _LOGGER.info("pi-native: could not run `pi --list-models` for the model picker")
++        return []
++    if result.returncode != 0:
++        _LOGGER.info("pi-native: `pi --list-models` failed; leaving the model picker empty")
++        return []
++    options: dict[str, dict[str, object]] = {}
++    in_table = False
++    for line in result.stdout.splitlines():
++        columns = line.split()
++        if not in_table:
++            in_table = columns[:2] == ["provider", "model"]
++            continue
++        if len(columns) < 2 or not _PI_PROVIDER_ID.fullmatch(columns[0]):
++            continue
++        qualified = f"{columns[0]}/{columns[1]}"
++        options[qualified] = {"id": qualified, "model": qualified, "displayName": columns[1]}
+     return [options[model_id] for model_id in sorted(options)]
+ 
+ 

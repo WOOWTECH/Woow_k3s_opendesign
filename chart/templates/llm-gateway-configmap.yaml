@@ -1,0 +1,36 @@
+{{- /*
+Same-workspace LiteLLM gateway URL (llmGateway.baseUrl, injected by the platform)
+as env LITELLM_BASE_URL for the main container (envFrom, optional), plus (#1538)
+OD_ALLOWED_INTERNAL_HOSTS = that URL's host name: the daemon's SSRF guard blocks a
+user-configured provider URL that resolves to a private address ("Internal IPs
+blocked" on test connection, model list and BYOK chat), and only this list exempts
+a host. Exactly the one LiteLLM FQDN, never a CIDR; a value the tenant put in
+config.extraConfig.OD_ALLOWED_INTERNAL_HOSTS is kept (this envFrom comes later and
+would otherwise hide it). Runtime data:
+deliberately NOT hashed into the pod template, and the pod only references this
+ConfigMap by name — injecting, changing or clearing the URL never changes the pod
+template, so the operator's password reset (helm upgrade --atomic --timeout 15s,
+then rollout restart) never waits for a new pod. Env is read at container start:
+a running container sees a new value after its next restart. Always rendered
+(data {} when unset) so the pod template is the same either way.
+tests/test-llm-gateway.sh locks this contract.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open-design.llmGatewayConfigMapName" . }}
+  labels:
+    {{- include "open-design.labels" . | nindent 4 }}
+{{- $url := include "open-design.llmGatewayBaseUrl" . }}
+{{- $internalHosts := include "open-design.llmGatewayAllowedInternalHosts" . }}
+{{- if or $url $internalHosts }}
+data:
+  {{- with $url }}
+  LITELLM_BASE_URL: {{ . | quote }}
+  {{- end }}
+  {{- with $internalHosts }}
+  OD_ALLOWED_INTERNAL_HOSTS: {{ . | quote }}
+  {{- end }}
+{{- else }}
+data: {}
+{{- end }}

@@ -1,0 +1,681 @@
+{{- if and (not .Values.authProxy.enabled) (has (lower .Values.config.bindHost) (list "127.0.0.1" "localhost" "::1")) }}
+{{- fail "authProxy.enabled=false requires config.bindHost=0.0.0.0 (a loopback-bound daemon with no in-pod proxy is unreachable)" }}
+{{- end }}
+{{- $daemonPort := .Values.service.targetPort -}}
+{{- $og := include "woow.omnigentHost.enabled" . -}}
+{{- $agentDefaults := include "open-design.agentDefaultsEnabled" . -}}
+{{- $runsPrune := include "open-design.runsPruneEnabled" . -}}
+{{- $initScripts := or $agentDefaults $runsPrune -}}
+{{- $daemonImage := printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) -}}
+{{- $mcp := include "open-design.mcp" . | fromYaml -}}
+{{- $paseo := include "open-design.paseo" . | fromYaml -}}
+{{- include "open-design.paseoValidate" . -}}
+{{- if and $mcp.enabled (not .Values.authProxy.enabled) }}
+{{- fail "mcp.enabled=true requires authProxy.enabled=true (the auth proxy is the only way to /mcp and /mcp-admin/)" }}
+{{- end }}
+{{- if and $mcp.enabled (or (not (regexMatch "^[.]?[A-Za-z0-9][A-Za-z0-9._-]{0,62}$" (toString $mcp.dataSubPath))) (contains ".." (toString $mcp.dataSubPath))) }}
+{{- fail "mcp.dataSubPath must be one relative directory name (no '/', no '..')" }}
+{{- end }}
+{{- if and $mcp.enabled (or (lt (int $mcp.port) 1024) (gt (int $mcp.port) 65535) (eq (int $mcp.port) (int .Values.service.targetPort)) (eq (int $mcp.port) (int .Values.authProxy.port))) }}
+{{- fail "mcp.port must be 1024-65535 and differ from service.targetPort and authProxy.port" }}
+{{- end }}
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- fail "replicaCount must be 0 or 1: the daemon owns two RWO PVCs, and the console RBAC is pinned to the single pod <fullname>-0 (platform #1360)" }}
+{{- end }}
+{{- /*
+  StatefulSet, not Deployment (platform #1360): the only way to give the daemon pod a
+  name known at render time (<fullname>-0), so the console Role can pin pods,
+  pods/exec and pods/log with resourceNames. A Deployment pod is <rs>-<random> and RBAC
+  has no label selectors, which left the console SA able to exec into every pod of the
+  tenant's workspace namespace (Odoo, PostgreSQL, n8n, other services' tokens).
+*/ -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "open-design.fullname" . }}
+  labels:
+    {{- include "open-design.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  # Required by apps/v1; only names the pod's DNS domain. Immutable once created.
+  serviceName: {{ include "open-design.serviceName" . }}
+  # Parallel, not OrderedReady: with OrderedReady a crash-looping pod blocks the
+  # rolling update, so an upgrade that FIXES the crash would never be applied
+  # (k8s "forced rollback" caveat). Single replica — ordering buys nothing here.
+  podManagementPolicy: Parallel
+  # One replica + RollingUpdate = delete the old pod, then create the new one: the
+  # same "release the two RWO PVCs first" behaviour the Deployment got from Recreate.
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "open-design.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "open-design.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if and .Values.networkPolicy.enabled .Values.networkPolicy.egressProfile }}
+        paas.woowtech.io/egress-profile: {{ .Values.networkPolicy.egressProfile | quote }}
+        {{- end }}
+      annotations:
+        # Roll the pod when the auth-proxy / daemon ConfigMap changes. subPath mounts
+        # don't hot-update and a ConfigMap edit alone won't roll the StatefulSet, so
+        # without this an upgrade that only touches the nginx config (e.g. the console
+        # /console route) never reaches the running nginx. gap #49.
+        checksum/authproxy-config: {{ include (print $.Template.BasePath "/auth-proxy-configmap.yaml") . | sha256sum }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if $paseo.enabled }}
+        checksum/paseo-launch: {{ include (print $.Template.BasePath "/paseo-configmap.yaml") . | sha256sum }}
+        {{- end }}
+        # Roll the pod when an LLM API key changes (#1435): the keys are secretKeyRef env
+        # vars, read once at container start — without this a key change from the platform
+        # updated the Secret but the daemon kept using the old key. admin_password is NOT
+        # part of it (a password reset reaches nginx through the Secret volume, #1360).
+        checksum/api-keys: {{ include "open-design.apiKeysChecksum" . | quote }}
+        {{- if $initScripts }}
+        checksum/agent-defaults: {{ include (print $.Template.BasePath "/agent-defaults-configmap.yaml") . | sha256sum }}
+        {{- end }}
+        # `kubectl exec` / `kubectl logs` without -c land in the daemon, not a sidecar.
+        kubectl.kubernetes.io/default-container: {{ .Chart.Name }}
+        {{- if $og }}
+        # Roll the pod when the omnigent-host KIT or OpenDesign's own Omnigent files
+        # (workspace seed, /console/ hook) change. Deliberately NOT the runtime
+        # ConfigMap (omnigentHost.serverUrl): injecting or changing the URL never
+        # restarts the pod; the supervisor re-reads the mounted file.
+        checksum/omnigent-host: {{ include "woow.omnigentHost.checksum" (dict "root" . "name" (include "open-design.omnigentHostConfigMapName" .)) }}
+        checksum/omnigent-od: {{ include "open-design.omnigentOdConfigMap" . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "open-design.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (include "open-design.podSecurityContext" . | fromYaml) }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # With the Omnigent host in the daemon container, SIGTERM first stops the host
+      # (up to ~20 s, shared/omnigent-host launch contract), then the daemon: at least
+      # 45 s, also when --reuse-values still carries the old 30.
+      terminationGracePeriodSeconds: {{ ternary (max (int .Values.terminationGracePeriodSeconds) 45) (int .Values.terminationGracePeriodSeconds) (eq $og "true") }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Upgrade from chart <= 0.2.x (daemon was a Deployment): helm creates this
+      # StatefulSet BEFORE it deletes the old Deployment. The anti-affinity keeps the
+      # new pod off the node where the old Deployment pod (it carries
+      # pod-template-hash) still runs, so its RWO PVCs cannot attach until the old pod
+      # is gone — two daemons never share /app/.od at the same time. Matches nothing
+      # afterwards (console pods have a different app.kubernetes.io/name).
+      affinity:
+        {{- with .Values.affinity }}
+        {{- toYaml (omit . "podAntiAffinity") | nindent 8 }}
+        {{- end }}
+        podAntiAffinity:
+          {{- with (dig "podAntiAffinity" "preferredDuringSchedulingIgnoredDuringExecution" list .Values.affinity) }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "open-design.selectorLabels" . | nindent 18 }}
+                matchExpressions:
+                  - key: pod-template-hash
+                    operator: Exists
+            {{- with (dig "podAntiAffinity" "requiredDuringSchedulingIgnoredDuringExecution" list .Values.affinity) }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $seedHome := .Values.homeSeed.enabled -}}
+      {{- /* Chart-managed Secret: the htpasswd is a Secret key mounted as a volume (see
+             volumes) — nginx re-reads auth_basic_user_file on every request and the
+             kubelet refreshes Secret volumes in place, so a password reset reaches this
+             pod WITHOUT a restart. That matters since #1360: the platform reset only
+             `rollout restart`s Deployments, and the daemon is now a StatefulSet. An
+             external auth.existingSecret has no htpasswd key → render it at start. */ -}}
+      {{- $authInit := and .Values.authProxy.enabled .Values.authProxy.basicAuth.enabled (not (empty .Values.auth.existingSecret)) -}}
+      {{- if or $seedHome $authInit $agentDefaults $runsPrune }}
+      initContainers:
+      {{- end }}
+      {{- if $seedHome }}
+        # Seed the default dotfiles into the home PVC — fill gaps only, NEVER overwrite.
+        #
+        # WHY: od-home mounts OVER /home/opendesign and SHADOWS the home baked into
+        # the image; the kubelet does NOT replay /etc/skel into a fresh volume, so a
+        # brand-new instance has no ~/.bashrc at all. The console terminal is
+        # `kubectl exec -- /bin/bash` — an interactive NON-login shell, which sources
+        # only /etc/bash.bashrc + ~/.bashrc — so ~/.bashrc is THE per-tenant shell
+        # customisation hook and it must exist. platform#407.
+        #
+        # Runs on EVERY pod start (not first-install-only): a file the tenant deleted
+        # comes back, a file the tenant edited is left strictly alone.
+        - name: seed-home
+          image: {{ include "open-design.homeSeedImage" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              # NOTE: deliberately NO `set -e` (and an unconditional exit 0 below) —
+              # a missing dotfile is cosmetic, but a failing initContainer would
+              # CrashLoop the whole instance. Seeding is best-effort by design.
+              SKEL={{ .Values.homeSeed.skelDir | quote }}
+              HOME_DIR={{ .Values.persistence.home.mountPath | quote }}
+              for f in{{ range .Values.homeSeed.files }} {{ . | quote }}{{ end }}; do
+                src="$SKEL/$f"
+                dst="$HOME_DIR/$f"
+                if [ ! -f "$src" ]; then
+                  echo "[seed-home] $src not in image — skip"
+                elif [ -e "$dst" ]; then
+                  echo "[seed-home] $dst exists — tenant-owned, skip (seed-if-absent)"
+                elif cp "$src" "$dst" 2>/dev/null && chmod 644 "$dst" 2>/dev/null; then
+                  echo "[seed-home] seeded $dst"
+                else
+                  echo "[seed-home] WARN: could not seed $dst (home volume not writable by uid $(id -u)?)"
+                fi
+              done
+              exit 0
+          securityContext:
+            # uid 1001 (opendesign). /home/opendesign is drwxrwsr-x root:opendesign
+            # and fsGroup=1001 makes the mounted volume group-writable, so the copies
+            # land owned by the same user the daemon/ttyd shell runs as.
+            runAsUser: {{ .Values.homeSeed.runAsUser }}
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          # initContainers also need requests+limits (paas-ws-* ns ResourceQuota).
+          resources:
+            {{- toYaml .Values.homeSeed.resources | nindent 12 }}
+          volumeMounts:
+            - name: od-home
+              mountPath: {{ .Values.persistence.home.mountPath }}
+      {{- end }}
+      {{- if $agentDefaults }}
+        # Out-of-the-box agent (#1437 / #1438): pin OpenCode's default model and choose the
+        # shared default agent from the keys that are SET (claude with an Anthropic key or
+        # a `claude login`, else opencode with an OpenRouter key). Tenant edits always win;
+        # rules in files/agent-defaults.py. Best effort: it always exits 0.
+        - name: agent-defaults
+          image: {{ $daemonImage | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - python3
+            - /etc/od-agent-defaults/agent-defaults.py
+          env:
+            - name: OD_DATA_PATH
+              value: {{ .Values.persistence.data.mountPath | quote }}
+            - name: OD_HOME_PATH
+              value: {{ .Values.persistence.home.mountPath | quote }}
+            - name: OD_DEFAULT_AGENT
+              value: {{ include "open-design.agentDefaultAgent" . | quote }}
+            - name: OD_OPENCODE_MODEL
+              value: {{ include "open-design.opencodeModel" . | quote }}
+            # Only whether they are set is used; never printed or stored.
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-design.secretName" . }}
+                  key: ANTHROPIC_API_KEY
+                  optional: true
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-design.secretName" . }}
+                  key: OPENROUTER_API_KEY
+                  optional: true
+          securityContext:
+            {{- include "open-design.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- $adRes := (.Values.agentDefaults | default dict).resources | default (dict "requests" (dict "cpu" "10m" "memory" "32Mi" "ephemeral-storage" "16Mi") "limits" (dict "cpu" "200m" "memory" "128Mi" "ephemeral-storage" "64Mi")) }}
+            {{- toYaml $adRes | nindent 12 }}
+          volumeMounts:
+            - name: od-data
+              mountPath: {{ .Values.persistence.data.mountPath }}
+            - name: od-home
+              mountPath: {{ .Values.persistence.home.mountPath }}
+            - name: agent-defaults
+              mountPath: /etc/od-agent-defaults
+              readOnly: true
+      {{- end }}
+      {{- if $runsPrune }}
+        # Orphan run records (0.5.1, AI-OD-007-6): remove <data>/runs/<id> whose project is gone
+        # from the database AND from <data>/projects — the daemon never does, and re-indexes
+        # them on every start. Runs before the daemon, od-data only, best effort (always exit 0).
+        # Rules and fail-safes in files/prune-orphan-runs.py; opt out with runsPrune.enabled=false.
+        - name: prune-runs
+          image: {{ $daemonImage | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - python3
+            - /etc/od-agent-defaults/prune-orphan-runs.py
+          env:
+            - name: OD_DATA_PATH
+              value: {{ .Values.persistence.data.mountPath | quote }}
+            - name: OD_RUNS_PRUNE_DRY_RUN
+              value: {{ ternary "true" "false" (eq (toString (.Values.runsPrune | default dict).dryRun) "true") | quote }}
+          securityContext:
+            {{- include "open-design.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- $rpRes := (.Values.runsPrune | default dict).resources | default (dict "requests" (dict "cpu" "10m" "memory" "32Mi" "ephemeral-storage" "16Mi") "limits" (dict "cpu" "200m" "memory" "128Mi" "ephemeral-storage" "64Mi")) }}
+            {{- toYaml $rpRes | nindent 12 }}
+          volumeMounts:
+            - name: od-data
+              mountPath: {{ .Values.persistence.data.mountPath }}
+            - name: agent-defaults
+              mountPath: /etc/od-agent-defaults
+              readOnly: true
+      {{- end }}
+      {{- if $authInit }}
+        # Render the nginx basic-auth htpasswd from the tenant admin_password. Kept
+        # out of the ConfigMap (sensitive) — written to an emptyDir the nginx sidecar
+        # reads. {PLAIN} scheme: admin_password is already in the Secret plaintext
+        # (console gate / ttyd), so this leaks nothing new and avoids bcrypt-salt churn.
+        - name: authproxy-init
+          image: "{{ .Values.authProxy.image.repository }}:{{ .Values.authProxy.image.tag }}"
+          imagePullPolicy: {{ .Values.authProxy.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              # Strip CR/LF so a stray newline in admin_password can't inject a second
+              # htpasswd line (nginx {PLAIN} reads to end-of-line).
+              CLEAN_PW=$(printf '%s' "$ADMIN_PASSWORD" | tr -d '\r\n')
+              printf '%s:{PLAIN}%s\n' "$BASIC_USER" "$CLEAN_PW" > /auth/.htpasswd
+              chmod 644 /auth/.htpasswd
+              echo "[authproxy-init] htpasswd written for user '$BASIC_USER'"
+          env:
+            # existingSecret mode only (the chart-managed Secret carries a ready htpasswd
+            # key instead). An external Secret may not carry admin_username, so the
+            # username stays a literal here.
+            - name: BASIC_USER
+              value: {{ include "open-design.basicAuthUsername" . | quote }}
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-design.secretName" . }}
+                  key: admin_password
+          securityContext:
+            {{- include "open-design.authProxySecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.authProxy.initResources | nindent 12 }}
+          volumeMounts:
+            - name: authproxy-auth
+              mountPath: /auth
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: {{ $daemonImage | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.image.enforceBindHost }}
+          # Override CMD ONLY, never `command`: the image's ENTRYPOINT stays
+          # [/sbin/tini, --, omnigent-host-entry] (tini reaps zombies as PID 1; the stub
+          # starts the daemon through the omnigent-host launcher whenever the kit is
+          # mounted, else it exec's the daemon unchanged). config.bindHost is authoritative: the upstream CMD's `--host 0.0.0.0`
+          # (daemon CLI flag > OD_BIND_HOST env) would otherwise ignore bindHost and
+          # listen on the pod IP, defeating the Option C loopback isolation.
+          args:
+            {{- if $paseo.enabled }}
+            # Keep the image ENTRYPOINT/bootstrap. Same process namespace as OD
+            # and stdio MCP: runtime /proc ownership checks must see these PIDs.
+            - python3
+            - /etc/opendesign-paseo/launch.py
+            - --
+            {{- end }}
+            - node
+            - apps/daemon/bin/od.mjs
+            - --host
+            - {{ .Values.config.bindHost | quote }}
+            - --port
+            - {{ $daemonPort | quote }}
+            - --no-open
+          {{- end }}
+          # Hardened defaults merged under .Values.securityContext (open-design.containerSecurityContext).
+          securityContext:
+            {{- include "open-design.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ $daemonPort }}
+              protocol: TCP
+          # Non-sensitive daemon env (OD_ALLOWED_ORIGINS / OD_PORT / OD_BIND_HOST).
+          envFrom:
+            - configMapRef:
+                name: {{ include "open-design.configMapName" . }}
+            # LITELLM_BASE_URL (same-workspace LiteLLM, llmGateway.baseUrl) from the runtime
+            # ConfigMap: referenced by name only, so the URL never enters this template and
+            # injecting / changing it never restarts the pod (templates/llm-gateway-configmap.yaml).
+            - configMapRef:
+                name: {{ include "open-design.llmGatewayConfigMapName" . }}
+                optional: true
+          env:
+            {{- if $paseo.enabled }}
+            - name: HOME
+              value: {{ .Values.persistence.home.mountPath | quote }}
+            # This is the OD data ROOT, not its paseo/ child. The app resolves and
+            # owns its own subtree; the chart never seeds, migrates or deletes it.
+            - name: OPENDESIGN_PASEO_DATA_DIR
+              value: {{ .Values.persistence.data.mountPath | quote }}
+            - name: OPENDESIGN_PASEO_ORIGIN
+              value: {{ include "open-design.paseoOrigin" . | quote }}
+            - name: OPENDESIGN_PASEO_NATIVE_PORT
+              value: {{ $daemonPort | quote }}
+            - name: OPENDESIGN_PASEO_BUNDLED_PLUGIN
+              value: /app/plugins/_official/woow/woow-paseo
+            - name: OPENDESIGN_PASEO_AUTO_ENABLE
+              value: "1"
+            {{- end }}
+            # INTERNAL token (optional:true — with loopback bind the daemon exempts
+            # nginx anyway; present for defense-in-depth / a 0.0.0.0 override).
+            - name: OD_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-design.secretName" . }}
+                  key: OD_API_TOKEN
+                  optional: true
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-design.secretName" . }}
+                  key: ANTHROPIC_API_KEY
+                  optional: true
+            # Server-side OpenRouter key for the in-container OpenCode runtime
+            # (BYOK keys typed in the web UI stay in the browser and never
+            # reach here). Optional: absent key → env unset.
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "open-design.secretName" . }}
+                  key: OPENROUTER_API_KEY
+                  optional: true
+            {{- if $og }}
+            # Omnigent host IN this container (shared/omnigent-host): the launcher runs the
+            # supervisor in the background next to the daemon; it waits for the tenant's
+            # `omnigent login` in /console/ (which execs into THIS container and writes
+            # to the same od-home dir), then keeps `omnigent host` connected. Sessions
+            # reach the daemon on 127.0.0.1:{{ $daemonPort }} through the OpenDesign MCP.
+            # unsetEnv: the host and its sessions never inherit OD_API_TOKEN. They DO get
+            # the platform's LLM keys (#1440: OpenCode via OpenRouter / Claude Code via an
+            # Anthropic key work on this machine) unless omnigentHost.stripApiKeys=true.
+            {{- end }}
+            {{- $strip := include "open-design.omnigentFlag" (dict "root" . "key" "stripApiKeys" "default" false) }}
+            {{- $seed := include "open-design.omnigentFlag" (dict "root" . "key" "seedWorkspace") }}
+            {{- include "woow.omnigentHost.env" (dict
+                  "root" .
+                  "configHome" (include "open-design.omnigentDir" .)
+                  "workspace" (include "open-design.omnigentWorkspace" .)
+                  "providers" "claude-subscription"
+                  "passthrough" "OD_DAEMON_URL,NODE_PATH,NODE_OPTIONS,PUPPETEER_EXECUTABLE_PATH,PUPPETEER_SKIP_DOWNLOAD,PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD,USE_BUILTIN_RIPGREP,LITELLM_BASE_URL"
+                  "unsetEnv" (ternary "ANTHROPIC_API_KEY,ANTHROPIC_AUTH_TOKEN,ANTHROPIC_BASE_URL,CLAUDE_CODE_OAUTH_TOKEN,OPENAI_API_KEY,OPENAI_BASE_URL,OPENROUTER_API_KEY,GEMINI_API_KEY,CODEX_ACCESS_TOKEN,OD_API_TOKEN" "OD_API_TOKEN" (eq $strip "true"))
+                  "seedDir" (ternary "/etc/omnigent-host-seed" "" (eq $seed "true"))
+                  "seedUpdate" "CLAUDE.md") | nindent 12 }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.authProxy.enabled }}
+          # Daemon binds loopback → the kubelet cannot httpGet it. A startupProbe
+          # guards the slow cold boot (heavy 2Gi image) so liveness can't kill it
+          # mid-init; liveness then restarts only a HUNG daemon. Pod READINESS is
+          # governed by the nginx sidecar (green once it can proxy /api/health).
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - curl -sf http://127.0.0.1:{{ $daemonPort }}/api/health || exit 1
+            periodSeconds: 10
+            failureThreshold: 30
+            timeoutSeconds: 5
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - curl -sf http://127.0.0.1:{{ $daemonPort }}/api/health || exit 1
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- else }}
+          # authProxy disabled → daemon bound 0.0.0.0, probed directly by the kubelet.
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- end }}
+          # The full plan limits (platform: 1 vCPU / 2Gi requests, 4 vCPU / 8Gi limits).
+          # The Omnigent host and its sessions share them (no split); the kit's memory
+          # guard kills a runaway session before this container hits its limit.
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- if $paseo.enabled }}
+            - name: paseo-launch
+              mountPath: /etc/opendesign-paseo
+              readOnly: true
+            {{- end }}
+            - name: od-data
+              mountPath: {{ .Values.persistence.data.mountPath }}
+            - name: od-home
+              mountPath: {{ .Values.persistence.home.mountPath }}
+            {{- include "woow.omnigentHost.volumeMounts" (dict "root" .) | nindent 12 }}
+            {{- if $og }}
+            # The /console/ terminal is `kubectl exec -- /bin/bash` (not a child of the
+            # launcher): Alpine's /etc/bash/bashrc sources /etc/bash/*.sh in every
+            # interactive bash, so this hook gives it the kit's `omnigent` guard on PATH
+            # and prints omnigent-host-status --motd when the tenant has to act.
+            - name: omnigent-host-kit
+              mountPath: /etc/bash/omnigent-host.sh
+              subPath: omnigent-host-profile.sh
+              readOnly: true
+            {{- if eq (include "open-design.omnigentFlag" (dict "root" . "key" "seedWorkspace")) "true" }}
+            - name: omnigent-seed
+              mountPath: /etc/omnigent-host-seed
+              readOnly: true
+            {{- end }}
+            {{- end }}
+        {{- if $mcp.enabled }}
+        # Built-in OpenDesign MCP server (0.5.0): the same image as the daemon (paas-odoo-ci
+        # open-design/mcp-runtime, /opt/woow), its own container so it has its own uid
+        # (10001, never the daemon's 1001), budget and restarts. Backend = the daemon over pod
+        # loopback (exempt from OD_API_TOKEN); clients reach it only through the auth proxy:
+        # /mcp (Bearer), /private_<token>/mcp (Claude.ai), /mcp-admin/ (basic-auth).
+        # No probes: pod readiness stays the auth proxy's (/api/health) — the MCP sidecar
+        # never takes the OpenDesign UI out of the Service while it restarts.
+        - name: mcp
+          image: {{ $daemonImage | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/opt/woow/bin/paas-opendesign-mcp"]
+          env:
+            - name: WOOW_OD_BACKEND_URL
+              value: "http://127.0.0.1:{{ $daemonPort }}"
+            - name: WOOW_OD_MCP_PORT
+              value: {{ $mcp.port | quote }}
+            {{- with (include "open-design.publicOrigin" .) }}
+            # Seeds the client endpoint <origin>/mcp shown on /mcp-admin/ (only while unset).
+            - name: WOOW_OD_MCP_PUBLIC_ORIGIN
+              value: {{ . | quote }}
+            {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: {{ $mcp.runAsUser }}
+            runAsGroup: {{ $mcp.runAsGroup }}
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            {{- toYaml $mcp.resources | nindent 12 }}
+          volumeMounts:
+            # State (token, tool policy): a directory of the od-data PVC, mounted only here.
+            # The runtime keeps it in a 0700 subdirectory of uid 10001.
+            - name: od-data
+              mountPath: /data/mcp
+              subPath: {{ $mcp.dataSubPath }}
+            - name: od-mcp-run
+              mountPath: /run/od-mcp
+        {{- end }}
+        {{- if .Values.authProxy.enabled }}
+        - name: authproxy
+          image: "{{ .Values.authProxy.image.repository }}:{{ .Values.authProxy.image.tag }}"
+          imagePullPolicy: {{ .Values.authProxy.image.pullPolicy }}
+          ports:
+            - name: proxy
+              containerPort: {{ .Values.authProxy.port }}
+              protocol: TCP
+          # READINESS proxies /api/health (credential-less callers get a bare {"ok":true}, 2xx only
+          # when the daemon answers) to the daemon — the pod
+          # is Ready only when nginx is up AND the daemon answers over loopback.
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: proxy
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # LIVENESS hits an nginx-LOCAL stub (return 200) — never the daemon — so a
+          # daemon outage restarts the DAEMON (its own exec liveness), NOT this healthy
+          # sidecar. Coupling nginx liveness to /api/health would restart the wrong
+          # container and CrashLoop nginx during a daemon outage / slow cold boot.
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: proxy
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- include "open-design.authProxySecurityContext" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.authProxy.resources | nindent 12 }}
+          volumeMounts:
+            # subPath (not a bare conf.d dir mount) so the main nginx.conf — which
+            # pins worker_processes (see auth-proxy-configmap) — lands at
+            # /etc/nginx/nginx.conf while the server block stays in conf.d/.
+            - name: authproxy-conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: authproxy-conf
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+              readOnly: true
+            {{- if include "woow.authguard.enabled" . }}
+            - name: authproxy-conf
+              mountPath: /etc/nginx/njs/authguard.js
+              subPath: authguard.js
+              readOnly: true
+            {{- end }}
+            {{- if .Values.authProxy.basicAuth.enabled }}
+            - name: authproxy-auth
+              mountPath: /etc/nginx/auth
+              readOnly: true
+            {{- end }}
+            {{- if $mcp.enabled }}
+            # admin.sock of the MCP sidecar (served at /mcp-admin/).
+            - name: od-mcp-run
+              mountPath: /run/od-mcp
+            {{- end }}
+        {{- end }}
+      volumes:
+        {{- if $paseo.enabled }}
+        - name: paseo-launch
+          configMap:
+            name: {{ include "open-design.fullname" . }}-paseo-launch
+            defaultMode: 0444
+        {{- end }}
+        {{- if $mcp.enabled }}
+        # admin.sock + the MCP child's socket. Mounted ONLY by the authproxy and mcp
+        # containers, never by the daemon container (tenant shells, agents): the mount is
+        # the access control of admin.sock.
+        - name: od-mcp-run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        {{- end }}
+        {{- if $initScripts }}
+        - name: agent-defaults
+          configMap:
+            name: {{ include "open-design.agentDefaultsConfigMapName" . }}
+            defaultMode: 0444
+        {{- end }}
+        {{- include "woow.omnigentHost.volumes" (dict "root" . "name" (include "open-design.omnigentHostConfigMapName" .)) | nindent 8 }}
+        {{- if and $og (eq (include "open-design.omnigentFlag" (dict "root" . "key" "seedWorkspace")) "true") }}
+        - name: omnigent-seed
+          configMap:
+            name: {{ include "open-design.omnigentOdConfigMapName" . }}
+            defaultMode: 0444
+            items:
+              - key: CLAUDE.md
+                path: CLAUDE.md
+              - key: .mcp.json
+                path: .mcp.json
+              - key: .claude__settings.json
+                path: .claude__settings.json
+        {{- end }}
+        {{- if .Values.persistence.data.enabled }}
+        - name: od-data
+          persistentVolumeClaim:
+            claimName: {{ include "open-design.dataPvcName" . }}
+        {{- else }}
+        # NON-persistent fallback — /app/.od is lost on pod restart.
+        - name: od-data
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.persistence.home.enabled }}
+        - name: od-home
+          persistentVolumeClaim:
+            claimName: {{ include "open-design.homePvcName" . }}
+        {{- else }}
+        # NON-persistent fallback — the claude.ai login session is lost on restart.
+        - name: od-home
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.authProxy.enabled }}
+        - name: authproxy-conf
+          configMap:
+            name: {{ include "open-design.authProxyConfigMapName" . }}
+        {{- if .Values.authProxy.basicAuth.enabled }}
+        - name: authproxy-auth
+          {{- if $authInit }}
+          emptyDir: {}
+          {{- else }}
+          # Mounted as a directory (NOT subPath — subPath never refreshes): the kubelet
+          # swaps the ..data symlink when the Secret changes and nginx reads the new
+          # file on the next request (#1360, see initContainers).
+          secret:
+            secretName: {{ include "open-design.secretName" . }}
+            defaultMode: 0444
+            items:
+              - key: htpasswd
+                path: .htpasswd
+          {{- end }}
+        {{- end }}
+        {{- end }}

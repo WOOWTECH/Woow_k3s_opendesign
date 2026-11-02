@@ -20,6 +20,9 @@ spec:
         {{- with .Values.console.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+        {{- if and .Values.networkPolicy.enabled .Values.networkPolicy.egressProfile .Values.networkPolicy.allowAllEgress .Values.console.runtimeInstall }}
+        paas.woowtech.io/egress-profile: {{ .Values.networkPolicy.egressProfile | quote }}
+        {{- end }}
       annotations:
         # Roll the console pod when its ConfigMap (entrypoint/connect/app.py) changes
         # — the app code is injected from the ConfigMap, so a chart edit must restart
@@ -108,22 +111,34 @@ spec:
               echo "[init] Starting console services..."
               exec python /app/entrypoint.py
           {{- end }}
+          {{- with (include "open-design.consoleSecurityContext" . | fromYaml) }}
+          # 0.5.1 (AI-OD-007-4): non-root, no capabilities, RuntimeDefault, read-only root fs.
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - containerPort: {{ .Values.console.service.dashboardPort }}
               name: http
             - containerPort: {{ .Values.console.service.ttydPort }}
               name: ttyd
           env:
+            {{- if not .Values.console.runtimeInstall }}
+            # kubectl's discovery cache (~/.kube/cache) and python's HOME: the writable emptyDir /tmp
+            # (the root filesystem is read-only, and uid 10002 has no passwd entry / home).
+            - name: HOME
+              value: /tmp
+            {{- end }}
             - name: NAMESPACE
               value: {{ .Release.Namespace | quote }}
-            # Daemon discovery targets — env-driven so the console works under any
-            # release name (svc-{ref[:8]}), not the upstream hard-coded values.
-            - name: POD_LABEL
-              value: "app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/name={{ include "open-design.name" . }}"
+            # Daemon targets — env-driven so the console works under any release name
+            # (svc-{ref[:8]}). #1360: the daemon is a StatefulSet, so its pod name is
+            # fixed and is the ONLY pod the console RBAC lets it get / exec / read logs of.
             - name: DAEMON_CONTAINER
               value: {{ .Chart.Name | quote }}
-            - name: DAEMON_DEPLOYMENT
+            - name: DAEMON_STATEFULSET
               value: {{ include "open-design.fullname" . | quote }}
+            - name: DAEMON_POD
+              value: {{ include "open-design.daemonPodName" . | quote }}
             - name: DAEMON_PORT
               value: {{ .Values.service.targetPort | quote }}
             - name: CONSOLE_TTYD_PORT
@@ -159,6 +174,13 @@ spec:
               mountPath: /mnt/scripts
             - name: html
               mountPath: /mnt/html
+            {{- if not .Values.console.runtimeInstall }}
+            # The startup script copies the ConfigMap app into /app; the root fs is read-only.
+            - name: app
+              mountPath: /app
+            - name: tmp
+              mountPath: /tmp
+            {{- end }}
           resources:
             {{- toYaml .Values.console.resources | nindent 12 }}
           {{- with .Values.console.readinessProbe }}
@@ -182,4 +204,12 @@ spec:
           configMap:
             name: {{ include "open-design.console.fullname" . }}-html
             defaultMode: 0644
+        {{- if not .Values.console.runtimeInstall }}
+        - name: app
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- end }}
 {{- end }}

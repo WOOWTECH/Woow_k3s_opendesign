@@ -1,0 +1,109 @@
+#!/opt/woow/.venv/bin/python
+"""Entry of the built-in OpenDesign MCP server: the command of the chart's `mcp` container (uid/gid 10001).
+
+Kubernetes starts this directly as uid 10001 (securityContext runAsUser/runAsGroup 10001, no privilege escalation,
+all capabilities dropped), so unlike the HA add-on there is no root bootstrap and no privilege drop:
+
+1. /data/mcp (od-data PVC subPath, created by the kubelet): must be a real, writable directory. The vendored Store
+   creates its state directory /data/mcp/state inside it, 0700 and owned by uid 10001; an existing one that is not
+   ours is refused (never repaired).
+2. /run/od-mcp (emptyDir shared with the auth proxy only): a stale admin.sock from a previous run of this
+   container is removed (only a socket owned by uid 10001); child/ is recreated empty, 0700.
+3. exec management.py with a FIXED environment: nothing of the container environment is inherited except the three
+   validated WOOW_OD_* settings (paas_opendesign_mcp.settings).
+"""
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+
+ROOT = Path('/opt/woow')
+sys.path.insert(0, str(ROOT))
+import paas_opendesign_mcp as glue  # noqa: E402
+
+NOFOLLOW_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def fail(message):
+    raise SystemExit('[paas-opendesign-mcp] ' + message)
+
+
+def owned_dir(path):
+    info = os.lstat(path)
+    return stat.S_ISDIR(info.st_mode) and info.st_uid == glue.UID
+
+
+def check_data():
+    try:
+        info = os.lstat(glue.DATA_ROOT)
+    except FileNotFoundError:
+        fail('%s is not mounted (chart: mcp.dataSubPath on the od-data PVC)' % glue.DATA_ROOT)
+    if not stat.S_ISDIR(info.st_mode):
+        fail('%s is not a directory' % glue.DATA_ROOT)
+    if not os.access(glue.DATA_ROOT, os.W_OK | os.X_OK):
+        fail('%s is not writable by uid %d' % (glue.DATA_ROOT, os.getuid()))
+    try:
+        if not owned_dir(glue.DATA_DIR):
+            fail('%s exists but is not a directory of uid %d; refusing it' % (glue.DATA_DIR, glue.UID))
+    except FileNotFoundError:
+        pass  # first start: the vendored Store creates it (0700)
+
+
+def prepare_run_dir():
+    try:
+        parent = os.open(glue.RUN_DIR, NOFOLLOW_DIR)
+    except OSError:
+        fail('%s is not mounted (chart: od-mcp-run emptyDir)' % glue.RUN_DIR)
+    try:
+        for name in (glue.ADMIN_SOCKET.name, glue.CHILD_DIR.name):
+            try:
+                info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if info.st_uid != glue.UID:
+                fail('%s/%s is not owned by uid %d' % (glue.RUN_DIR, name, glue.UID))
+            if name == glue.CHILD_DIR.name and stat.S_ISDIR(info.st_mode):
+                shutil.rmtree(name, dir_fd=parent)  # rmtree with dir_fd never follows symlinks
+            elif name == glue.ADMIN_SOCKET.name and stat.S_ISSOCK(info.st_mode):
+                os.unlink(name, dir_fd=parent)
+            else:
+                fail('%s/%s has an unexpected type' % (glue.RUN_DIR, name))
+        os.mkdir(glue.CHILD_DIR.name, 0o700, dir_fd=parent)
+        child = os.open(glue.CHILD_DIR.name, NOFOLLOW_DIR, dir_fd=parent)
+        try:
+            os.fchmod(child, 0o700)
+        finally:
+            os.close(child)
+    finally:
+        os.close(parent)
+
+
+def main():
+    if len(sys.argv) != 1:
+        fail('takes no arguments')
+    if os.geteuid() == 0 or (os.getuid(), os.getgid()) != (glue.UID, glue.GID):
+        fail('must run as uid/gid %d (chart mcp.runAsUser / mcp.runAsGroup), never root' % glue.UID)
+    os.umask(0o077)
+    try:
+        config = glue.settings()
+    except glue.SettingsError as error:
+        fail(str(error))
+    check_data()
+    prepare_run_dir()
+    python = str(ROOT / '.venv/bin/python')
+    env = {'PATH': '/usr/bin:/bin', 'HOME': str(glue.DATA_ROOT),
+           'PYTHONPATH': str(ROOT / 'packages/mcp-admin-core') + ':' + str(ROOT),
+           'PYTHONDONTWRITEBYTECODE': '1', 'PYTHONUNBUFFERED': '1',
+           'WOOW_OD_BACKEND_URL': config['backend'], 'WOOW_OD_MCP_PORT': str(config['port'])}
+    if config['endpoint']:
+        env['WOOW_OD_MCP_PUBLIC_ORIGIN'] = config['endpoint'][:-len('/mcp')]
+    os.chdir(ROOT)
+    os.execve(python, [python, str(ROOT / 'paas_opendesign_mcp/management.py')], env)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except OSError as error:
+        raise SystemExit('[paas-opendesign-mcp] startup failed: %s' % type(error).__name__) from None

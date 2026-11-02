@@ -12,9 +12,9 @@ changes are reviewed and approved there, then synced here with
 
 | Directory | Contents |
 |---|---|
-| [`image/`](image/) | OpenDesign daemon image — upstream `ghcr.io/nexu-io/od` **0.24.1** + Claude Code **2.1.284** + OpenCode **1.18.33**, with a build-time version contract |
+| [`image/`](image/) | OpenDesign daemon image — the PaaS shell on `open-design-core` (built from the Woow fork `woow-od-v0.24.1-w2.11`, OpenDesign **0.24.1**) + Claude Code **2.1.296**, Codex **0.162.1**, Pi **1.1.0**, OpenCode **1.18.33**, Omnigent **0.16.0**, with build-time version contracts |
 | [`console/`](console/) | Console image — ttyd web terminal + Flask dashboard |
-| [`chart/`](chart/) | Per-tenant Helm chart **0.2.1** installed by the PaaS operator |
+| [`chart/`](chart/) | Per-tenant Helm chart **0.5.10** installed by the PaaS operator |
 
 Source commits for each directory are recorded in [MIRROR.md](MIRROR.md).
 
@@ -28,7 +28,7 @@ service page ("Admin Credentials"); saving restarts the daemon and console.
 ## CI
 
 [`ci.yml`](.github/workflows/ci.yml) validates only: `helm lint`, the chart's
-own tests, and a no-push build of both images. Production artifacts are built
+own tests (three of them need the Gitea charts layout and are skipped here), and a no-push build of both images (the daemon shell on the public, digest-pinned core `OD_CORE` in `ci.yml`). Production artifacts are built
 and published from Gitea behind a manual approval gate.
 
 ## History

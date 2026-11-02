@@ -134,9 +134,11 @@ homeSeed:
     requests:
       cpu: 10m
       memory: 16Mi
+      ephemeral-storage: 16Mi
     limits:
       cpu: 100m
       memory: 64Mi
+      ephemeral-storage: 64Mi
 
 # ── Daemon env / config ───────────────────────────────────────────────────────
 # Non-sensitive daemon env → ConfigMap (upstream 02-config.yaml), consumed via
@@ -191,8 +193,38 @@ authProxy:
   # worker per HOST cpu (NOT cgroup-aware): on a high-core node (e.g. 256 vCPU) that is
   # 256 workers → blows the small `resources.limits.memory` below → OOMKilled (137)
   # CrashLoop. A loopback-fronting proxy needs only a couple of workers.
+  # AI-FIX-SEC-1 (#1457) — auth-proxy guard (templates/_authproxy-guard.tpl, shared/authproxy-guard).
+  # Every key is optional; the defaults live in the template, so an upgrade with --reuse-values from an
+  # older chart behaves like a fresh install.
+  #   guard:
+  #     enabled: true          # false = no njs module/mount at all (headers + server_tokens off stay)
+  #     maxFailures: 10        # wrong logins from one client IP ...
+  #     windowSeconds: 120     # ... inside this window ...
+  #     lockSeconds: 300       # ... lock that IP out (429 + Retry-After, correct password included)
+  #     sharedDictSize: 1m     # RAM for the per-pod counters (a pod restart clears every lock)
+  #     loginPaths: []         # POST paths whose 401 counts as a wrong login (app login forms)
+  #     headers:
+  #       enabled: true        # HSTS, nosniff, X-Frame-Options, CSP frame-ancestors, Referrer-Policy, Permissions-Policy
+  #       hsts: "max-age=15552000"
+  #       frameOptions: SAMEORIGIN
+  #       contentSecurityPolicy: "frame-ancestors 'self'"
+  #       referrerPolicy: strict-origin-when-cross-origin
+  #       permissionsPolicy: "geolocation=(), payment=(), usb=()"
   workerProcesses: 2
   workerConnections: 1024
+  # #1538: the daemon only serves ~30 routes (live-artifact preview, plugin Remix,
+  # Composio connector config, diagnostics export, Design Harness, library, memory
+  # connectors, ...) to a loopback Host with no foreign Origin. When enabled, nginx
+  # forwards exactly those routes with Host 127.0.0.1:<port> and no Origin, after
+  # checking basic auth and that any Origin is one of config.allowedOrigins; daemon
+  # shutdown / db vacuum are refused outright. false = the old behaviour (all 403).
+  localRoutes:
+    enabled: true
+  # 0.5.1 (AI-OD-007-4): securityContext of the nginx sidecar and its htpasswd init container
+  # (nginx-unprivileged: uid/gid 101). Merged OVER the hardened defaults
+  # (open-design.authProxySecurityContext: non-root, drop ALL, no privilege escalation,
+  # RuntimeDefault seccomp). Root filesystem stays writable: nginx buffers under /tmp.
+  securityContext: {}
   basicAuth:
     enabled: true
     # Tenant-changeable from the platform (it re-renders this value and
@@ -200,20 +232,91 @@ authProxy:
     # open-design.basicAuthUsername: 1-64 of A-Z a-z 0-9 . _ @ - .
     username: "admin"
   # tiny init container (writes the htpasswd from admin_password) + nginx resources.
+  # ephemeral-storage (#1434): nginx buffers request bodies (client_max_body_size 100m)
+  # under /tmp/client_temp; the limit leaves room for a few concurrent uploads.
   resources:
     requests:
       cpu: 25m
       memory: 32Mi
+      ephemeral-storage: 32Mi
     limits:
       cpu: 200m
       memory: 128Mi
+      ephemeral-storage: 512Mi
   initResources:
     requests:
       cpu: 10m
       memory: 16Mi
+      ephemeral-storage: 16Mi
     limits:
       cpu: 100m
       memory: 64Mi
+      ephemeral-storage: 64Mi
+
+# ── Built-in OpenDesign MCP server (0.5.0) ───────────────────────────────────
+# The OpenDesign MCP server for EXTERNAL clients (Claude Code / Claude Desktop /
+# Claude.ai / other agents), built into this service — it replaces the separate
+# "Open Design MCP" (mcp-opendesign) template. The runtime is the HA add-on's built-in
+# MCP (WOOWTECH/Woow_ha_opendesign_add_on mcp-runtime: Woow MCP gateway + vendored
+# opendesign_mcp_server, the same 15 tools, defaults and protections), shipped in the
+# daemon image (/opt/woow, paas-odoo-ci open-design/mcp-runtime) and run as its own
+# sidecar container `mcp` in this pod, uid/gid 10001:
+#   - backend fixed to the daemon over pod loopback (127.0.0.1:<service.targetPort>);
+#     the daemon exempts loopback peers from OD_API_TOKEN, so no backend credential;
+#   - MCP listener 127.0.0.1:<mcp.port>; the auth proxy routes
+#       /mcp                  → Bearer <MCP token> (Claude Code, Claude Desktop, agents)
+#       /private_<token>/mcp  → the token as a path secret (Claude.ai custom connector;
+#                               never logged)
+#     WITHOUT basic-auth — the gateway checks the token itself;
+#   - /mcp-admin/ (behind the SAME basic-auth as the UI): show / rotate / revoke the MCP
+#     token, switch tools off; served from a Unix socket in an emptyDir that ONLY the
+#     authproxy and mcp containers mount (never the daemon container);
+#   - state (token, tool switches) on the od-data PVC under mcp.dataSubPath, mounted only
+#     into the mcp container (0700, uid 10001). A pod restart / upgrade keeps the token.
+# ⚠ All 15 tools are on by default (owner decision), including create_project / send_message,
+# which start an agent run: with no AI key configured, an MCP client that picks the `opencode`
+# agent can still make OpenCode call an external model (its own free models; the daemon
+# container has internet egress) and cause external usage. Documented, not restricted.
+# ⚠ Cloudflare Access: the MCP paths share the service's host name. If the tenant puts
+# that host name behind Cloudflare Access, external MCP clients (Claude.ai in particular,
+# which cannot pass an Access login) are blocked: leave Access off, or add Access bypass
+# rules for /mcp and /private_*/mcp. The chart does not change Access.
+# In-container agent CLIs keep using upstream `od mcp` (stdio), unchanged.
+mcp:
+  # Default OFF: an image without /opt/woow (anything before the mcp-runtime build)
+  # would CrashLoop this container. The platform turns it on in the SAME seed change
+  # that pins an image carrying the runtime (atomic pin).
+  enabled: false
+  # 127.0.0.1 only (pod loopback). The daemon container shares the network namespace,
+  # so its processes can reach it too — they still need the token. 1024-65535, not the
+  # daemon's or the auth proxy's port.
+  port: 8081
+  # One directory name on the od-data PVC (kubelet-created subPath).
+  dataSubPath: .woow-mcp
+  runAsUser: 10001
+  runAsGroup: 10001
+  # Measured: ~90 MiB for the gateway + child at rest. Counted in the workspace quota
+  # with the daemon's 8Gi, the auth proxy's 128Mi and the console's 512Mi (platform
+  # template min_ram_gb).
+  resources:
+    requests:
+      cpu: 50m
+      memory: 160Mi
+      ephemeral-storage: 16Mi
+    limits:
+      cpu: 500m
+      memory: 320Mi
+      ephemeral-storage: 128Mi
+
+# Optional Paseo native launcher. Enable only with an immutable optional image
+# containing /opt/opendesign-paseo/bin/serve.mjs, its locked runtime, the bundled
+# woow-paseo plugin and the native atomic MCP entry API. No NODE_OPTIONS preload.
+# OD, stdio MCP and Paseo share the SAME container and PID namespace. The image
+# ENTRYPOINT is preserved; only the explicit daemon argv is wrapped.
+paseo:
+  enabled: false
+  # Concrete HTTPS origin; empty uses the first config.allowedOrigins origin.
+  origin: ""
 
 # ── Auth / secrets ────────────────────────────────────────────────────────────
 # Sensitive env. Route mirrors mcp-server (#357): the CD/operator injects an
@@ -237,6 +340,70 @@ auth:
   # typed in the web UI stay in the browser and are unaffected. Empty → omitted.
   openrouterApiKey: ""
 
+# ── Out-of-the-box agent + OpenCode model (#1437 / #1438) ─────────────────────
+# An `agent-defaults` initContainer (daemon image, uid 1001) runs files/agent-defaults.py
+# on every pod start, before the daemon. It sees only whether the API keys are SET (never
+# prints or stores them). Details and the exact ownership rules: the script's header.
+#   * OpenCode's "Default (CLI config)" model is pinned in ~/.config/opencode/opencode.jsonc
+#     (chart-managed while the tenant has not edited it; only with an OpenRouter key).
+#   * The shared default agent in /app/.od/app-config.json: claude when Claude can run
+#     (Anthropic key, or a `claude login`), else opencode when an OpenRouter key is set.
+#     Replaced only when unset, "amr" (OpenDesign Cloud, not installed), an unusable
+#     "claude", or still the value the chart set last time — a tenant's own pick is kept.
+#     A fresh instance also skips upstream's first-run page (its main button is the
+#     OpenDesign Cloud sign-up).
+agentDefaults:
+  enabled: true
+  # auto | claude | opencode | keep (never touch app-config.json).
+  defaultAgent: auto
+  # OpenCode model id (provider/model). Must support tool calls (OpenCode always sends
+  # tools). The tenant can still pick any model per run in the UI, or edit the file.
+  # The platform may override it per service. "" → no pin (OpenCode picks by name — the
+  # failure mode of #1438).
+  opencodeModel: "openrouter/openai/gpt-5-mini"
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+      ephemeral-storage: 16Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+      ephemeral-storage: 64Mi
+
+# ── Orphan run records (0.5.1, AI-OD-007-6) ───────────────────────────────────
+# The daemon keeps one record per agent run under /app/.od/runs/<runId>/state.json (user
+# prompt, error text, artifact paths) and never deletes it: deleting a project leaves
+# its runs readable via GET /api/runs/<id> and re-indexed on every start. Upstream
+# behaviour; the real fix belongs in the daemon (project delete -> drop its runs).
+# Mitigation here: the `prune-runs` initContainer (daemon image, uid 1001, od-data only,
+# BEFORE the daemon starts so nothing races it) removes every runs/<id> whose projectId is
+# set but is neither a row of the daemon's `projects` table nor a directory under projects/.
+# Fail-safe: no database, unreadable table, no projectId, or any doubt -> nothing is touched
+# (best effort, always exit 0, prints counts only, never a prompt or a path). A run of a
+# project deleted while the pod is up stays readable until the next daemon start.
+# runsPrune.dryRun=true only logs what it would remove.
+runsPrune:
+  enabled: true
+  dryRun: false
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+      ephemeral-storage: 16Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+      ephemeral-storage: 64Mi
+
+# ── White label (#1439) ───────────────────────────────────────────────────────
+# The image (paas-odoo-ci open-design, white-label*.py) points the "Contact us" dialog and
+# the leftover upstream community links at WoowTech: support@woowtech.io and the
+# same-origin path /_woow/support, which the auth proxy answers with a 302 to supportUrl
+# (so the target changes without a new image). Images older than that patch never call it.
+whiteLabel:
+  supportUrl: "https://aiot.woowtech.io/woow"
+
 # ── Probes (daemon; GET /api/health on 7457 — upstream 04-deployment.yaml) ─────
 readinessProbe:
   initialDelaySeconds: 20
@@ -249,35 +416,131 @@ livenessProbe:
   timeoutSeconds: 5
   failureThreshold: 5
 
-# ── Pod hardening (daemon) ────────────────────────────────────────────────────
+# ── Pod hardening (daemon, which also runs the Omnigent host) ────────────────
 # fsGroup 1001 so BOTH RWO PVCs are group-writable by the opendesign user (uid
-# 1001, home /home/opendesign) — upstream 04-deployment.yaml. runAsNonRoot /
-# readOnlyRootFilesystem are intentionally NOT forced: the daemon runs agent CLIs
-# (Claude Code / OpenCode) that write into $HOME and /app/.od. Conservative stance
-# mirrors home-assistant — tighten via values once the image is verified.
+# 1001, home /home/opendesign) — upstream 04-deployment.yaml. The template adds
+# fsGroupChangePolicy: OnRootMismatch whenever fsGroup is set (no recursive chmod
+# on every start; omnigent's 0600 token file stays 0600).
+# securityContext is merged OVER hardened defaults (open-design.containerSecurityContext),
+# so they also apply after a --reuse-values upgrade that still carries `{}`.
+# Verified with the omnigent image: daemon, OpenDesign MCP, chromium (--no-sandbox),
+# Claude Code and `omnigent host` all run as uid 1001 with no capabilities and
+# RuntimeDefault seccomp. readOnlyRootFilesystem stays off: agent CLIs write to /tmp.
 podSecurityContext:
   fsGroup: 1001
-securityContext: {}
-#  allowPrivilegeEscalation: false
-#  capabilities:
-#    drop:
-#      - ALL
+  fsGroupChangePolicy: OnRootMismatch
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+  allowPrivilegeEscalation: false
+  privileged: false
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
 
 # ── Resources (daemon — the platform's heaviest service) ──────────────────────
+# The full plan limits (the platform pins the same values). The Omnigent host and
+# its sessions run INSIDE this container and share them — there is no separate
+# budget; the kit's memory guard kills a runaway session first (README).
+# ephemeral-storage (#1434): everything the container writes outside its two PVCs — /tmp
+# (agent CLIs, chromium exports), the image's writable layer, its logs — lands on the
+# node's root disk. Over the limit the kubelet evicts THIS pod (data on the PVCs stays)
+# instead of the node reaching DiskPressure and evicting other tenants. The platform's
+# helm_default_values pins only cpu/memory; Helm merges the maps, so these keys stay.
 resources:
   requests:
     cpu: "1"
     memory: 2Gi
+    ephemeral-storage: 1Gi
   limits:
     cpu: "4"
     memory: 8Gi
+    ephemeral-storage: 4Gi
 
 # Extra env for the daemon container (list of {name, value}). e.g. TZ.
 extraEnv: []
 #  - name: TZ
 #    value: Asia/Taipei
 
-terminationGracePeriodSeconds: 30
+# SIGTERM → the omnigent-host launcher stops the host first (≤ ~20 s), then the
+# daemon. With omnigentHost enabled the template never renders less than 45.
+terminationGracePeriodSeconds: 45
+
+# ── Omnigent host (in the daemon container; shared kit shared/omnigent-host) ──
+# Makes this OpenDesign a machine ("host") of an Omnigent service, so an Omnigent
+# chat can run HERE with the tenant's own Claude Code login and drive OpenDesign
+# through its MCP server over loopback: decks / brand assets it makes land in
+# /app/.od and show up in the OpenDesign UI.
+#
+# The host runs INSIDE the daemon container, like a daemon on an ordinary machine:
+# the image's ENTRYPOINT (tini → omnigent-host-entry) starts the daemon through the
+# kit's launcher, which also starts the supervisor in the background. The host
+# dials OUT to the Omnigent service (in-cluster URL; networkPolicy.omnigentEgress).
+# No sidecar, no extra container, no resource split.
+#
+# The tenant connects it ONCE from the /console/ terminal:
+#   omnigent login <Omnigent URL>          (username + password)
+# WOOW default: log in with the Omnigent `admin` account (owner of the hosts).
+# ACCEPTED RISK (user decision): sessions AND OpenDesign's own agent runs execute as
+# the same user and can read the stored refresh grant (~/.omnigent/auth_tokens.json on
+# od-home), i.e. act as the logged-in Omnigent account (admin by default). See README
+# "已接受的風險" and the shared/omnigent-host README, Accounts.
+# The supervisor only sleeps until then (measured idle RSS: a few MB), then keeps
+# `omnigent host` running and brings it back with the same host id after every
+# restart (identity in ~/.omnigent/config.yaml on od-home). The platform never
+# logs in, stores or sees an Omnigent token. The terminal shows the status / the
+# exact command whenever the tenant has to act (login expired, account switched →
+# reset-id, …). A second manual `omnigent host` in the terminal is refused
+# ("already running, managed automatically").
+# OOM: the host tree runs with oom_score_adj 1000 and the supervisor's memory guard
+# kills the largest session process at 90 % of the container limit, so a runaway
+# session dies before the daemon. Runs OpenDesign itself starts (also via the MCP
+# start_run) are the daemon's children and are not guarded.
+# An image without the omnigent CLI (older than the omnigent layer) starts the
+# daemon exactly as before (no host).
+omnigentHost:
+  # Legacy chart-managed host only. Keep OFF with the native woow-omnigent plugin:
+  # the daemon owns its supervisor, private persistent state and GUI setup. Enabling
+  # this kit would add a second host manager and inject legacy configuration paths.
+  # The native integration is supplied by the image, not by this switch. New installs
+  # request the server URL and credentials in Plugins -> Omnigent -> Settings.
+  # Off = no legacy kit ConfigMaps, OG_* env, mounts or kit-specific network rule.
+  enabled: false
+  # The same-workspace Omnigent URL (injected by the platform), e.g.
+  # http://<release>-omnigent.<ns>.svc.cluster.local:8000. Rendered ONLY into the
+  # runtime ConfigMap <fullname>-omnigent-host-runtime (not part of the pod
+  # template): setting or changing it never restarts the pod. Only a hint for the
+  # login command and a fallback: the host always uses the URL the tenant logged
+  # in to. An in-cluster URL of that form also pins the NetworkPolicy hole to that
+  # one Omnigent release (networkPolicy.omnigentEgress). "" → "omnigent login <Omnigent URL>".
+  serverUrl: ""
+  # Name in Omnigent's machine list; "" → "open-design · <release>". Unique per
+  # Omnigent account. Changing it renames the host in place (same host id).
+  hostName: ""
+  # Working directory for Omnigent sessions (absolute; must live on the od-home
+  # PVC). "" → <persistence.home.mountPath>/studio (/home/opendesign/studio).
+  workspace: ""
+  # Login re-check period (seconds) of a running host; >= 30 (render fails below).
+  watchSeconds: 120
+  # Seed the workspace with CLAUDE.md (zh-TW designer brief + OpenDesign MCP
+  # workflow), .mcp.json (the OpenDesign MCP server over loopback, project scope)
+  # and .claude/settings.json (allow the OpenDesign tools, deny delete_project /
+  # delete_file — best effort, not a security boundary). Tracked in a manifest
+  # (~/.omnigent/omnigent-host/workspace-seed.json): a file the tenant deleted is
+  # never re-created (the opt-out), an edited file is never overwritten; CLAUDE.md
+  # alone is updated to a newer chart version while the tenant has not edited it
+  # (otherwise the new version is offered under .omnigent-seed-updates/).
+  seedWorkspace: true
+  # OpenDesign's internal API token never reaches the host or its sessions. The LLM API
+  # keys the platform set (auth.anthropicApiKey / auth.openrouterApiKey) DO (#1440): with
+  # only an OpenRouter key the OpenCode harness is usable on this machine (it reads
+  # OPENROUTER_API_KEY and the model pinned by agentDefaults), with an Anthropic key Claude
+  # Code too; a tenant's own `claude login` keeps working. true → the pre-0.4.0 behaviour:
+  # the host also loses the LLM keys, so only a `claude login` in /console/ works there.
+  stripApiKeys: false
 
 serviceAccount:
   create: true
@@ -325,6 +588,16 @@ console:
   # Pinned tool versions for the runtimeInstall bootstrap (ignored in baked mode).
   ttydVersion: "1.7.7"
 
+  # 0.5.1 (AI-OD-007-4): the console no longer runs as root with the default capability set.
+  # Baked image only (runtimeInstall=true needs root for apt/pip and stays as it was): uid/gid
+  # runAsUser, drop ALL capabilities, no privilege escalation, RuntimeDefault seccomp,
+  # read-only root filesystem (the ConfigMap app is copied into the emptyDir /app, HOME and
+  # kubectl's cache live in the emptyDir /tmp). securityContext is merged OVER these defaults
+  # (open-design.consoleSecurityContext); it only hardens the console's own container —
+  # the kubectl-exec terminal into the daemon still runs as the daemon's uid 1001.
+  runAsUser: 10002
+  securityContext: {}
+
   service:
     type: ClusterIP
     dashboardPort: 18790   # Flask dashboard
@@ -334,9 +607,11 @@ console:
     requests:
       cpu: 100m
       memory: 128Mi
+      ephemeral-storage: 32Mi
     limits:
       cpu: 500m
       memory: 512Mi
+      ephemeral-storage: 256Mi
 
   # console readiness/liveness (tcpSocket on the dashboard port). The runtimeInstall
   # bootstrap is slow (downloads + pip) → generous initialDelay; baked mode is fast
@@ -350,9 +625,10 @@ console:
     periodSeconds: 30
     failureThreshold: 5
 
-  # RBAC (Role scoped to THIS release's daemon): find/exec/logs the daemon pod,
-  # rollout-restart the daemon Deployment (PATCH, by name), patch the daemon Secret
-  # (API-key updates). false → SA still created but with no grants (kubectl degrades).
+  # RBAC (Role scoped to THIS release, every rule pinned by resourceNames): get/exec/logs
+  # the daemon pod <fullname>-0, rollout-restart the daemon StatefulSet (get + patch).
+  # No Secret access since 0.5.3 (console-ttyd-exposure). false → SA still created but
+  # with no grants (kubectl degrades).
   rbac:
     create: true
 
@@ -360,6 +636,30 @@ console:
 
   podLabels: {}
   podAnnotations: {}
+
+# ── Same-workspace LiteLLM (model gateway) ────────────────────────────────────
+# The in-cluster OpenAI-compatible base URL of a LiteLLM service in the same
+# workspace, e.g. http://<release>-litellm.<ns>.svc.cluster.local:4000/v1 —
+# INJECTED BY THE PLATFORM (the oldest running LiteLLM of the workspace); a
+# non-empty value set by the tenant wins and is never overwritten. Only the URL
+# is injected, never a key: the tenant creates a virtual key in LiteLLM's admin
+# UI and pastes it into the agent's own settings (README "同工作區 LiteLLM").
+# The daemon container gets it as env LITELLM_BASE_URL (also the /console/
+# terminal, which execs into it, and Omnigent sessions on this host) from a
+# small runtime ConfigMap that is NOT hashed into the pod template, so setting
+# or changing it never restarts the pod (the password reset stays within its
+# 15 s budget); a running pod picks it up at its next restart. OPENAI_BASE_URL / ANTHROPIC_BASE_URL are deliberately
+# NOT set (that would hijack the tenant's own provider setup). While it is set,
+# networkPolicy.litellmEgress opens the daemon → LiteLLM proxy hole. Not an
+# http(s) URL → ignored (no env, no hole; NOTES says so), never a render failure.
+# #1538: the same runtime ConfigMap also sets OD_ALLOWED_INTERNAL_HOSTS to this
+# URL's host name — the daemon's SSRF guard otherwise blocks the cluster-internal
+# address ("Internal IPs blocked" on test connection / model list / BYOK chat).
+# Only that one FQDN is exempted, never a CIDR. allowInternalHost=false keeps the
+# guard strict (the tenant must then use LiteLLM's public URL).
+llmGateway:
+  baseUrl: ""
+  allowInternalHost: true
 
 # ── NetworkPolicy (default-deny + converged egress; np-audit #42) ─────────────
 # CRITICAL (np-audit #42 F-1/2/3): the daemon runs AI agent CLIs (arbitrary egress)
@@ -370,6 +670,13 @@ console:
 # on TCP 443/80 only. Modelled on the verified charts/agent-runtime §6.3 template.
 networkPolicy:
   enabled: true
+  # 商用驗收 egress-all-ports-open（AI-HER-008-2、AI-OD-007-9）：daemon pod（StatefulSet）與 runtimeInstall 的 console 帶
+  # paas.woowtech.io/egress-profile=<這個值>。平台 baseline（paas-baseline-egress）的公網規則是
+  # 任意埠，NetworkPolicy 是聯集，下面 externalPorts 的公網限制原本無效；operator 開
+  # TENANT_BASELINE_EGRESS_WEB_PROFILE 後，帶 web 的 pod 改由 paas-baseline-egress-web（同 ns＋DNS＋
+  # 公網 TCP 80/443）管，chart 的限制才生效。operator 沒開＝只是多一個 label，行為不變。
+  # 空字串＝不加 label（回到被一般 baseline 選到）。networkPolicy.enabled=false 時也不加。
+  egressProfile: web
   # Namespaces allowed to reach the daemon proxy / console, matched by
   # kubernetes.io/metadata.name. EMPTY (default) → NO ingress allow rule; CS-ns
   # ingress is governed by the operator baseline NetworkPolicy (#279/#280).
@@ -394,6 +701,8 @@ networkPolicy:
     - 169.254.0.0/16   # link-local incl. cloud metadata 169.254.169.254
     - 100.64.0.0/10    # CGNAT (Tailscale / WARP)
     - 127.0.0.0/8
+    - 224.0.0.0/4 # multicast (mDNS / SSDP leak across tenants on the node bridge, #1441)
+    - 240.0.0.0/4 # reserved + limited broadcast 255.255.255.255
   # Console kubectl → kube-apiserver. EXPLICIT allowlist (never allow-all). The
   # apiserver ClusterIP lives in the excluded Service CIDR, so it needs its own hole.
   # ⚠ PLATFORM: set the real target(s). Default = the k3s kubernetes service ClusterIP;
@@ -407,6 +716,39 @@ networkPolicy:
   # DNS egress narrowed to the kube-dns pods (k8s-app=kube-dns) rather than the whole
   # kube-system namespace (np-audit F-7). Set false if your cluster DNS isn't labelled.
   dnsKubeDnsOnly: true
+  # Daemon pod (the Omnigent host in the daemon container and the /console/
+  # `omnigent login`) → the Omnigent SERVER pod in the same namespace, so the
+  # in-cluster URL (http://<release>-omnigent.<ns>.svc.cluster.local:8000) works.
+  # The internet rule above excludes 10.0.0.0/8, so without this hole only the
+  # public https URL works. Pod-label + port scoped, never the whole namespace or
+  # the Service CIDR: the selector carries the labels charts/omnigent renders on
+  # its server pod (app.kubernetes.io/name=omnigent, component=server; runner pods
+  # do not match), and when omnigentHost.serverUrl is such an in-cluster URL it
+  # also pins app.kubernetes.io/instance=<release> → exactly that one server.
+  # Rendered only while omnigentHost is enabled; missing keys (--reuse-values from
+  # 0.2.1) fall back to these defaults.
+  omnigentEgress:
+    enabled: true
+    podLabels:
+      app.kubernetes.io/name: omnigent
+      app.kubernetes.io/component: server
+    ports:
+      - 8000
+  # Daemon pod → the same-workspace LiteLLM proxy pod (charts/litellm: name=litellm,
+  # component=app; its database pod does not match) on its pod port, so the
+  # in-cluster llmGateway.baseUrl works — the internet rule above excludes
+  # 10.0.0.0/8. Rendered only while llmGateway.baseUrl is set (an empty URL keeps
+  # LiteLLM blocked); missing keys (--reuse-values) fall back to these defaults.
+  litellmEgress:
+    enabled: true
+    podLabels:
+      app.kubernetes.io/name: litellm
+      app.kubernetes.io/component: app
+    ports:
+      - 4000
+  # Workspace = LAN (woow_paas_platform #1441): every pod of this namespace, every port.
+  sameNamespaceEgress: true
+  sameNamespaceIngress: true
 
 podLabels: {}
 podAnnotations: {}

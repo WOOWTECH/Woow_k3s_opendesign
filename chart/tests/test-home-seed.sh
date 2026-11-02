@@ -23,7 +23,7 @@ command -v yq >/dev/null 2>&1 || { echo "SKIP (home-seed): yq (mikefarah) requir
 fail() { echo "FAIL (home-seed): $1"; exit 1; }
 
 daemon_dep() {
-  yq 'select(.kind=="Deployment" and .metadata.labels."app.kubernetes.io/component"=="daemon")'
+  yq 'select(.kind=="StatefulSet" and .metadata.labels."app.kubernetes.io/component"=="daemon")'
 }
 
 OUT="$($HELM template t "$CHART_DIR" 2>/dev/null)"
@@ -70,31 +70,32 @@ printf '%s' "$SCRIPT" | grep -Eq '(^|[^a-z])rm ' && fail "seed script contains r
 # fail-soft: a cosmetic dotfile must not CrashLoop the instance.
 printf '%s' "$SCRIPT" | grep -Eq '^[[:space:]]*set -e' && fail "seed script uses 'set -e' — a failed seed would block the whole pod from starting"
 
-# Ordering: seed-home runs before authproxy-init (home first, then the gate).
-IC0="$(printf '%s' "$DEP" | yq '.spec.template.spec.initContainers[0].name')"
-[ "$IC0" = "seed-home" ] || fail "initContainers[0]='$IC0', expected seed-home"
-# The pre-existing authproxy-init must survive the refactor.
-AP="$(printf '%s' "$DEP" | yq '.spec.template.spec.initContainers[] | select(.name=="authproxy-init") | .name')"
-[ "$AP" = "authproxy-init" ] || fail "authproxy-init initContainer disappeared"
+# Ordering: seed-home first, then agent-defaults (0.4.0, #1437 — it writes under the
+# seeded home). Chart-managed Secret → no authproxy-init (#1360: the htpasswd is a Secret
+# volume); existingSecret → authproxy-init follows.
+IC="$(printf '%s' "$DEP" | yq '[.spec.template.spec.initContainers[].name] | join(",")')"
+[ "$IC" = "seed-home,agent-defaults,prune-runs" ] || fail "initContainers='$IC', expected seed-home,agent-defaults,prune-runs"
+EXTIC="$($HELM template t "$CHART_DIR" --set auth.existingSecret=od-ext 2>/dev/null | daemon_dep | yq '[.spec.template.spec.initContainers[].name] | join(",")')"
+[ "$EXTIC" = "seed-home,agent-defaults,prune-runs,authproxy-init" ] || fail "existingSecret: initContainers='$EXTIC', expected seed-home,agent-defaults,prune-runs,authproxy-init"
 
 # ── Toggles ──────────────────────────────────────────────────────────────────
 
-# homeSeed.enabled=false → no seed-home, authproxy-init untouched.
-OFF="$($HELM template t "$CHART_DIR" --set homeSeed.enabled=false 2>/dev/null | daemon_dep)"
+# homeSeed.enabled=false → no seed-home, authproxy-init untouched (existingSecret mode).
+OFF="$($HELM template t "$CHART_DIR" --set homeSeed.enabled=false --set agentDefaults.enabled=false --set runsPrune.enabled=false --set auth.existingSecret=od-ext 2>/dev/null | daemon_dep)"
 S_OFF="$(printf '%s' "$OFF" | yq '.spec.template.spec.initContainers[] | select(.name=="seed-home")')"
 [ -z "$S_OFF" ] || fail "homeSeed.enabled=false still rendered seed-home"
 A_OFF="$(printf '%s' "$OFF" | yq '.spec.template.spec.initContainers[0].name')"
 [ "$A_OFF" = "authproxy-init" ] || fail "homeSeed off: initContainers[0]='$A_OFF', expected authproxy-init"
 
 # basicAuth off + homeSeed on → seed-home is the ONLY initContainer.
-NOAUTH="$($HELM template t "$CHART_DIR" --set authProxy.basicAuth.enabled=false 2>/dev/null | daemon_dep)"
+NOAUTH="$($HELM template t "$CHART_DIR" --set authProxy.basicAuth.enabled=false --set agentDefaults.enabled=false --set runsPrune.enabled=false 2>/dev/null | daemon_dep)"
 N="$(printf '%s' "$NOAUTH" | yq '.spec.template.spec.initContainers | length')"
 [ "$N" = "1" ] || fail "basicAuth off: expected exactly 1 initContainer (seed-home), got $N"
 N0="$(printf '%s' "$NOAUTH" | yq '.spec.template.spec.initContainers[0].name')"
 [ "$N0" = "seed-home" ] || fail "basicAuth off: initContainers[0]='$N0', expected seed-home"
 
 # both off → the initContainers key must not be emitted at all.
-NONE="$($HELM template t "$CHART_DIR" --set homeSeed.enabled=false --set authProxy.basicAuth.enabled=false 2>/dev/null | daemon_dep)"
+NONE="$($HELM template t "$CHART_DIR" --set homeSeed.enabled=false --set authProxy.basicAuth.enabled=false --set agentDefaults.enabled=false --set runsPrune.enabled=false 2>/dev/null | daemon_dep)"
 IC_NONE="$(printf '%s' "$NONE" | yq '.spec.template.spec | has("initContainers")')"
 [ "$IC_NONE" = "false" ] || fail "both seeds off: initContainers key still emitted"
 

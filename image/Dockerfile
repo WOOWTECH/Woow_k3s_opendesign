@@ -1,111 +1,81 @@
-# OpenDesign daemon image for the WOOW PaaS open-design cloud service.
-#
-# Base = the upstream prebuilt image (nexu-io/open-design deploy/Dockerfile,
-# node:24-alpine, WORKDIR /app, daemon at apps/daemon, data dir /app/.od,
-# user open-design uid/gid 1001). Building on it instead of cloning + pnpm
-# building the app here keeps the daemon byte-identical to upstream's release
-# and drops the old best-effort `|| true` source build.
-#
-# Pinned by INDEX digest (multi-arch); the platform is amd64-only.
-# Bump = change the tag AND the digest together, then re-pin the platform seed.
-ARG OD_BASE=ghcr.io/nexu-io/od:0.24.1@sha256:587a992857d0f8b71011e4bc55c5851e33ef9fc4c169fc17e6447700ac428f22
-FROM ${OD_BASE}
+# OpenDesign daemon image for the WOOW PaaS open-design cloud service = the PaaS shell
+# around open-design-core (Dockerfile.core). Everything OpenDesign, the CLIs, the
+# toolchain and the woow-patches are in the core; this file adds the runtime contract
+# the chart relies on and the built-in OpenDesign MCP server (mcp-runtime/, run by the
+# chart's `mcp` sidecar container from chart open-design 0.5.0). Omnigent is in the
+# core and its native daemon owns host setup. build-open-design-image.yml builds the core first and
+# passes its local tag as CORE; the last stage (paas) is the published image. No default
+# on purpose: a build without the core fails.
+ARG CORE
 
-ARG CLAUDE_CODE_VERSION=2.1.284
-ARG OPENCODE_VERSION=1.18.33
-ARG SVGO_VERSION=4.1.0
-ARG MERMAID_CLI_VERSION=12.0.0
-ARG SHARP_CLI_VERSION=6.1.0
-ARG UV_VERSION=0.12.20
-
+# --- Built-in Woow OpenDesign MCP server: admin UI assets (mcp-runtime/README.md) ---
+# Built with the core image's own Node/npm from the vendored, lock-pinned UI sources; only
+# dist/ is kept (the same stage as the HA add-on). --include=dev because the core
+# sets NODE_ENV=production.
+FROM ${CORE} AS woow-mcp-ui
 USER root
+WORKDIR /ui
+COPY mcp-runtime/ha/vendor/packages/mcp-admin-ui/ ./
+RUN /usr/local/bin/npm ci --include=dev --ignore-scripts --no-audit --no-fund \
+    && /usr/local/bin/npm run build \
+    && test -f dist/index.html
 
-# Puppeteer (pulled in by mermaid-cli) must not download its own Chrome:
-# there is no glibc Chrome for Alpine. It uses the Alpine chromium below.
-ENV PUPPETEER_SKIP_DOWNLOAD=1 \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser \
-    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
-    PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
+# --- Managed Paseo runtime (@getpaseo/cli, lock-pinned), built INTO the image (issue #448) ---
+# The host package below used to run `npm ci` into the tenant data volume the first time Paseo was enabled: about
+# 0.8 GB, registry TCP/443 and a 300 s budget, found out only at runtime. It is installed here instead, with the
+# package's own layout module, so the release path, lock hash and receipt are exactly what the host verifies when
+# it activates (src/runtime-context.mjs picks <package root>/managed-runtime). Same core = same node/npm/libc as the
+# runtime that used to run npm. Nothing is written to the tenant volumes and nothing is downloaded at container start.
+FROM ${CORE} AS paseo-runtime
+USER root
+COPY paseo-runtime/vendor/pi-paseo/ /opt/pi-paseo/
+# The @getpaseo/* npm packages carry no LICENSE file; Paseo is Apache-2.0 (github.com/getpaseo/paseo, no NOTICE), so the
+# text travels with the runtime now that the image redistributes it (Apache-2.0 section 4(a)).
+COPY paseo-legal/getpaseo-Apache-2.0.txt /opt/opendesign-paseo/managed-runtime/LICENSES/getpaseo-Apache-2.0.txt
+RUN set -eu; \
+    export npm_config_cache=/tmp/npm-cache; \
+    ROOT=$(node --input-type=module -e 'import {prepareRuntimeManifest} from "/opt/pi-paseo/src/runtime-layout.mjs"; console.log(prepareRuntimeManifest({runtimeDir:"/opt/opendesign-paseo/managed-runtime"}))'); \
+    npm ci --prefix "$ROOT" --omit=dev --no-audit --no-fund; \
+    test "$(node "$ROOT/node_modules/@getpaseo/cli/bin/paseo" --version)" = 0.11.2; \
+    test -s "$ROOT/node_modules/@getpaseo/server/dist/server/web-ui/index.html"; \
+    node --input-type=module -e 'import {markRuntimeReady,runtimeReady} from "/opt/pi-paseo/src/runtime-layout.mjs"; const loc={runtimeDir:"/opt/opendesign-paseo/managed-runtime"}; markRuntimeReady(loc); if(!runtimeReady(loc)) process.exit(1)'; \
+    chmod -R a+rX,go-w /opt/opendesign-paseo/managed-runtime; \
+    rm -rf /tmp/npm-cache /root/.npm
 
-# Toolchain the agents (Claude Code / OpenCode) and design skills call out to.
-# libgcc/libstdc++ + ripgrep are Claude Code's documented Alpine prerequisites.
-# poppler-utils, tini, git and bash already come from the base image.
-RUN apk add --no-cache \
-      bash curl ca-certificates git jq ripgrep unzip wget tmux \
-      libgcc libstdc++ \
-      chromium font-noto-cjk font-noto-emoji fontconfig ttf-dejavu \
-      ffmpeg sox pngquant ghostscript vips-tools \
-      python3 py3-pip \
-    && fc-cache -f
+FROM ${CORE} AS shell-base
 
-# Agent CLIs + design npm tools, all pinned. Every version is asserted below:
-# a mismatch or a missing binary FAILS the build instead of shipping silently
-# (the previous image swallowed install failures with `|| echo`).
-RUN npm install -g --omit=dev \
-      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-      "opencode-ai@${OPENCODE_VERSION}" \
-      "svgo@${SVGO_VERSION}" \
-      "@mermaid-js/mermaid-cli@${MERMAID_CLI_VERSION}" \
-      "sharp-cli@${SHARP_CLI_VERSION}" \
-    && npm cache clean --force
-
-# uv / uvx (musl build; the platform is amd64-only).
-RUN curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-musl.tar.gz" \
-      | tar xz -C /tmp \
-    && install -m 0755 /tmp/uv-x86_64-unknown-linux-musl/uv /tmp/uv-x86_64-unknown-linux-musl/uvx /usr/local/bin/ \
-    && rm -rf /tmp/uv-*
-
-# Python helpers used by design skills (search, HTTP, imaging, templating).
-RUN python3 -m venv /opt/venv \
-    && /opt/venv/bin/pip install --no-cache-dir \
-         ddgs anthropic openai httpx requests aiohttp websockets \
-         pillow lxml rich Jinja2 Markdown PyYAML click
-
-# Home directory. The chart mounts the od-home PVC at /home/opendesign, which
-# hides whatever the image puts there, so the dotfiles live in /etc/skel and
-# the chart's seed-home init container copies them in (seed-if-absent).
-# The upstream user is a system user with no home and /sbin/nologin; point its
-# passwd entry at the real home and bash, since tools that read the passwd
-# home (OpenCode among them) would otherwise resolve a missing directory.
-RUN mkdir -p /home/opendesign /etc/skel \
-    && printf '%s\n' \
-         '# ~/.bashrc — seeded once by the chart; yours to edit.' \
-         'export PATH="/opt/venv/bin:$PATH"' \
-         'PS1='"'"'\u@opendesign:\w\$ '"'"'' \
-         > /etc/skel/.bashrc \
-    && printf '%s\n' '[ -f ~/.bashrc ] && . ~/.bashrc' > /etc/skel/.profile \
-    && printf '%s\n' '# ~/.bash_logout' > /etc/skel/.bash_logout \
-    && cp /etc/skel/.bashrc /etc/skel/.profile /etc/skel/.bash_logout /home/opendesign/ \
-    && awk -F: 'BEGIN{OFS=":"} $1=="open-design"{$6="/home/opendesign";$7="/bin/bash"} {print}' /etc/passwd > /tmp/passwd \
-    && cat /tmp/passwd > /etc/passwd && rm /tmp/passwd \
-    && chown -R open-design:open-design /home/opendesign /app/.od
-
-ENV HOME=/home/opendesign \
-    PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    USE_BUILTIN_RIPGREP=0 \
-    NODE_OPTIONS=--max-old-space-size=4096 \
-    OD_BIND_HOST=127.0.0.1 \
-    OD_PORT=7457
-
-# Build-time contract. Runs as the runtime user so a binary that only works
-# for root fails here, not in a tenant pod.
+# --- Built-in Woow OpenDesign MCP server (mcp-runtime/README.md) ---
+# The HA add-on's built-in MCP runtime, unchanged (mcp-runtime/ha/ = pinned copy of
+# WOOWTECH/Woow_ha_opendesign_add_on mcp-runtime, HA_SOURCE.json: gateway, tool surface,
+# defaults, protections, admin page), its hash-pinned wheels for the core's Python, user mcp
+# (10001), plus the PaaS placement (paas_opendesign_mcp). Code is root-owned and read-only
+# under /opt/woow; the chart runs /opt/woow/bin/paas-opendesign-mcp in its own container as
+# uid 10001 with state on the od-data PVC (subPath).
+USER root
+COPY --from=woow-mcp-ui /ui/dist /opt/woow/packages/mcp-admin-ui/dist
+COPY mcp-runtime/ /tmp/mcp-runtime/
+# Same public, lock-pinned Paseo runtime as the HA shell. The native launcher and
+# atomic MCP API are compiled in the shared core; the chart owns supervision.
+COPY paseo-runtime/ /opt/opendesign-paseo/
+RUN sh /tmp/mcp-runtime/install.sh && rm -rf /tmp/mcp-runtime \
+    && cd /opt/opendesign-paseo \
+    && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && node --input-type=module -e 'import {verifyBundledInstallation} from "./host/standalone.mjs"; if (!verifyBundledInstallation("/app/plugins/_official/woow/woow-paseo", process.cwd())) process.exit(1)' \
+    && chmod -R a+rX,go-w /opt/opendesign-paseo
+# Immutable, root-owned, read-only for uid 1001. The host package finds it from its own package root and uses it in
+# place once its receipt matches the lock it ships (paseo-runtime/src/runtime-context.mjs); no environment variable.
+COPY --from=paseo-runtime /opt/opendesign-paseo/managed-runtime /opt/opendesign-paseo/managed-runtime
 USER open-design
-RUN set -e; \
-    test "$(id -u)" = "1001"; \
-    test "$(getent passwd open-design | cut -d: -f6)" = "/home/opendesign"; \
-    test -f /app/apps/daemon/bin/od.mjs; \
-    test -f /app/apps/daemon/dist/cli.js; \
-    v=$(claude --version | awk '{print $1}');   test "$v" = "${CLAUDE_CODE_VERSION}" || { echo "claude $v != ${CLAUDE_CODE_VERSION}"; exit 1; }; \
-    v=$(opencode --version | tr -d '[:space:]'); test "$v" = "${OPENCODE_VERSION}"   || { echo "opencode $v != ${OPENCODE_VERSION}"; exit 1; }; \
-    for b in node npm git bash rg jq curl chromium-browser ffmpeg pdftotext svgo mmdc sharp uv uvx python3; do \
-      command -v "$b" >/dev/null || { echo "missing: $b"; exit 1; }; \
-    done; \
-    /opt/venv/bin/python -c 'import ddgs, anthropic, openai, httpx, PIL, lxml, jinja2, yaml'; \
-    echo "contract OK: claude ${CLAUDE_CODE_VERSION}, opencode ${OPENCODE_VERSION}"
 
 WORKDIR /app
 EXPOSE 7457
-ENTRYPOINT ["/sbin/tini", "--"]
 # The chart overrides this with --host <config.bindHost> --port <targetPort>
 # (image.enforceBindHost); this default matches it for direct `docker run`.
+CMD ["node", "apps/daemon/bin/od.mjs", "--host", "127.0.0.1", "--port", "7457", "--no-open"]
+
+# The native daemon starts its bundled Omnigent host after GUI setup. Keep the
+# legacy chart omnigentHost.enabled=false; never insert a second supervisor here.
+FROM shell-base AS paas
+ENTRYPOINT ["/sbin/tini", "--"]
+# Setting ENTRYPOINT resets an inherited CMD; repeat it in the published stage.
 CMD ["node", "apps/daemon/bin/od.mjs", "--host", "127.0.0.1", "--port", "7457", "--no-open"]

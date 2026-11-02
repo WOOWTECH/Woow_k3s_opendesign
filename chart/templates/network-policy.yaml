@@ -50,6 +50,12 @@ spec:
               kubernetes.io/metadata.name: {{ . | quote }}
         {{- end }}
     {{- end }}
+    {{- if .Values.networkPolicy.sameNamespaceIngress }}
+    # Workspace = LAN (woow_paas_platform #1441): every pod of this namespace, on
+    # every port.
+    - from:
+        - podSelector: {}
+    {{- end }}
   egress:
     # (1) DNS resolution.
     - to:
@@ -77,6 +83,43 @@ spec:
       ports:
         - protocol: TCP
           port: {{ int .Values.console.service.ttydPort }}
+    {{- end }}
+    {{- with (include "open-design.omnigentEgress" . | fromYaml) }}
+    # daemon pod (the omnigent host inside the daemon container + the /console/
+    # `omnigent login`) → the Omnigent
+    # server in THIS namespace over the in-cluster URL. In-cluster hole like the
+    # console one above: pod-label + port scoped, never the whole namespace or the
+    # Service CIDR (pinned to one release when omnigentHost.serverUrl names it).
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .podLabels | nindent 14 }}
+      ports:
+        {{- range .ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+    {{- with (include "open-design.litellmEgress" . | fromYaml) }}
+    # daemon pod (OpenDesign's agents and the /console/ terminal) → the same-workspace
+    # LiteLLM proxy over the in-cluster URL the platform injects (llmGateway.baseUrl).
+    # In-cluster hole like the Omnigent one: only while that URL is set, pod-label +
+    # port scoped, never the whole namespace or the Service CIDR.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- toYaml .podLabels | nindent 14 }}
+      ports:
+        {{- range .ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    {{- end }}
+    {{- if .Values.networkPolicy.sameNamespaceEgress }}
+    # Workspace = LAN (woow_paas_platform #1441): every pod of this namespace, on
+    # every port (the tenant's other services over their in-cluster addresses).
+    - to:
+        - podSelector: {}
     {{- end }}
     {{- if .Values.networkPolicy.allowAllEgress }}
     # (2) daemon → the internet (Anthropic API, agent CLIs). ipBlock EXCLUDES cluster
@@ -134,6 +177,12 @@ spec:
             matchLabels:
               {{- include "open-design.selectorLabels" $ | nindent 14 }}
     {{- end }}
+    {{- if .Values.networkPolicy.sameNamespaceIngress }}
+    # Workspace = LAN (woow_paas_platform #1441): every pod of this namespace, on
+    # every port.
+    - from:
+        - podSelector: {}
+    {{- end }}
   egress:
     # (1) DNS resolution.
     - to:
@@ -164,6 +213,12 @@ spec:
         - protocol: TCP
           port: {{ . }}
         {{- end }}
+    {{- end }}
+    {{- if .Values.networkPolicy.sameNamespaceEgress }}
+    # Workspace = LAN (woow_paas_platform #1441): every pod of this namespace, on
+    # every port (the tenant's other services over their in-cluster addresses).
+    - to:
+        - podSelector: {}
     {{- end }}
     {{- if and .Values.networkPolicy.allowAllEgress .Values.console.runtimeInstall }}
     # (3) console runtimeInstall bootstrap → github.com / dl.k8s.io / pypi. Same safe

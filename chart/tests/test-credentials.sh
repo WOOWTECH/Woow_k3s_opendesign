@@ -2,9 +2,9 @@
 #
 # Tenant credential contract (0.2.1):
 #   - authProxy.basicAuth.username is tenant-changeable from the platform; it is
-#     rendered into the chart Secret (admin_username) and BOTH the auth-proxy
-#     htpasswd init (BASIC_USER) and the console (CONSOLE_BASIC_USER → ttyd -c +
-#     Flask dashboard) read it via secretKeyRef — one credential for both
+#     rendered into the chart Secret (admin_username + the auth-proxy `htpasswd`
+#     key, #1360) and the console (CONSOLE_BASIC_USER → ttyd -c + Flask dashboard)
+#     reads it via secretKeyRef — one credential for both
 #   - REGRESSION GUARD: changing the username must NOT change any pod template.
 #     The operator resets credentials with `helm upgrade --atomic --timeout 15s`
 #     (i.e. --wait); a pod-template change makes helm wait for new pods
@@ -25,19 +25,21 @@ HELM="${HELM_BINARY:-helm}"
 command -v yq >/dev/null 2>&1 || { echo "SKIP (credentials): yq (mikefarah) required"; exit 0; }
 fail() { echo "FAIL (credentials): $1"; exit 1; }
 
-daemon='select(.kind=="Deployment" and .metadata.labels."app.kubernetes.io/component"=="daemon")'
+daemon='select(.kind=="StatefulSet" and .metadata.labels."app.kubernetes.io/component"=="daemon")'
 console='select(.kind=="Deployment" and .metadata.labels."app.kubernetes.io/component"=="console")'
 secret='select(.kind=="Secret" and .metadata.name=="t-open-design-secrets")'
 
 render() { $HELM template t "$CHART_DIR" "$@" 2>/dev/null; }
 init_user() { yq "$daemon"' | .spec.template.spec.initContainers[] | select(.name=="authproxy-init") | .env[] | select(.name=="BASIC_USER")'; }
 console_user() { yq "$console"' | .spec.template.spec.containers[0].env[] | select(.name=="CONSOLE_BASIC_USER")'; }
-templates() { yq 'select(.kind=="Deployment") | .spec.template'; }
+templates() { yq 'select(.kind=="Deployment" or .kind=="StatefulSet") | .spec.template'; }
 
 # Default: username in the Secret; both consumers read it from there.
 OUT="$(render)"
 [ "$(printf '%s' "$OUT" | yq "$secret"' | .stringData.admin_username')" = "admin" ] || fail "Secret admin_username must default to admin"
-for who in init_user console_user; do
+[ -z "$(printf '%s' "$OUT" | init_user)" ] || fail "chart-managed Secret: htpasswd comes from the Secret, no authproxy-init BASIC_USER expected"
+[ "$(printf '%s' "$OUT" | yq "$secret"' | .stringData.htpasswd' | cut -d: -f1)" = "admin" ] || fail "Secret htpasswd must carry the username"
+for who in console_user; do
   KEY="$(printf '%s' "$OUT" | $who | yq '.valueFrom.secretKeyRef.key')"
   [ "$KEY" = "admin_username" ] || fail "$who must come from secretKeyRef admin_username (got '$KEY')"
   [ "$(printf '%s' "$OUT" | $who | yq 'has("value")')" = "false" ] || fail "$who must not carry a literal value"
@@ -47,6 +49,13 @@ done
 CUSTOM="$(render --set authProxy.basicAuth.username=design.team@woow)"
 [ "$(printf '%s' "$CUSTOM" | yq "$secret"' | .stringData.admin_username')" = "design.team@woow" ] \
   || fail "custom username did not reach the Secret"
+[ "$(printf '%s' "$CUSTOM" | yq "$secret"' | .stringData.htpasswd' | cut -d: -f1)" = "design.team@woow" ] \
+  || fail "custom username did not reach the Secret htpasswd"
+# ... and so does a password change, again without touching a pod template.
+PW="$(render --set-string config.sensitive.admin_password=n3w-Pass)"
+[ "$(printf '%s' "$PW" | yq "$secret"' | .stringData.htpasswd')" = "admin:{PLAIN}n3w-Pass" ] || fail "new password did not reach the Secret htpasswd"
+[ "$(printf '%s' "$OUT" | templates)" = "$(printf '%s' "$PW" | templates)" ] \
+  || fail "changing the password changed a pod template — the 15 s credential reset would roll back"
 
 # ... and every pod template (daemon AND console) is byte-identical.
 [ "$(printf '%s' "$OUT" | templates)" = "$(printf '%s' "$CUSTOM" | templates)" ] \
@@ -65,12 +74,20 @@ for bad in 'a:b' 'a b' '' "$LONG" 'tab	x' 'ünïcode'; do
   fi
 done
 
-# OpenRouter key: absent by default, present when set, env ref always optional.
-H="$(printf '%s' "$OUT" | yq "$secret"' | .stringData | has("OPENROUTER_API_KEY")')"
-[ "$H" = "false" ] || fail "OPENROUTER_API_KEY in Secret although auth.openrouterApiKey is empty"
+# LLM keys (#1556): ALWAYS in the Secret, "" when unset or cleared — a key dropped from
+# stringData stays in the live Secret's data, so a cleared key would keep working.
+# Present when set; env ref always optional (auth.existingSecret may omit them).
+for k in OPENROUTER_API_KEY ANTHROPIC_API_KEY; do
+  [ "$(printf '%s' "$OUT" | yq "$secret"' | .stringData | has("'"$k"'")')" = "true" ] || fail "#1556: Secret must always carry $k (\"\" when unset)"
+  [ "$(printf '%s' "$OUT" | yq "$secret"' | .stringData.'"$k")" = "" ] || fail "#1556: unset $k must render as \"\""
+done
+CLR="$(render --set-string auth.openrouterApiKey= --set-string auth.anthropicApiKey= | yq "$secret" | yq -o=json -I=0 '.stringData | {"o": .OPENROUTER_API_KEY, "a": .ANTHROPIC_API_KEY}')"
+[ "$CLR" = '{"o":"","a":""}' ] || fail "#1556: cleared LLM keys must render as \"\" (got $CLR)"
+VA="$(render --set auth.anthropicApiKey=sk-ant-test | yq "$secret"' | .stringData.ANTHROPIC_API_KEY')"
+[ "$VA" = "sk-ant-test" ] || fail "auth.anthropicApiKey not rendered into the Secret (got '$VA')"
 OPT="$(printf '%s' "$OUT" | yq "$daemon"' | .spec.template.spec.containers[0].env[] | select(.name=="OPENROUTER_API_KEY") | .valueFrom.secretKeyRef.optional')"
 [ "$OPT" = "true" ] || fail "daemon OPENROUTER_API_KEY env must be an optional secretKeyRef (got '$OPT')"
 V="$(render --set auth.openrouterApiKey=sk-or-test | yq "$secret"' | .stringData.OPENROUTER_API_KEY')"
 [ "$V" = "sk-or-test" ] || fail "auth.openrouterApiKey not rendered into the Secret (got '$V')"
 
-echo "PASS (credentials): username in Secret for htpasswd + console, pod templates unchanged by a username change, existingSecret literal, unsafe usernames rejected, OpenRouter key optional."
+echo "PASS (credentials): username/password in Secret (htpasswd key + console), pod templates unchanged by a username change, existingSecret literal, unsafe usernames rejected, LLM keys always rendered (\"\" when unset/cleared, #1556) with optional env refs."

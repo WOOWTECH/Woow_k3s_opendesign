@@ -1,0 +1,16 @@
+{{- if or (include "open-design.agentDefaultsEnabled" .) (include "open-design.runsPruneEnabled" .) }}
+# The scripts of the agent-defaults (#1437 / #1438; files/agent-defaults.py) and prune-runs
+# (0.5.1, AI-OD-007-6; files/prune-orphan-runs.py) initContainers, mounted at
+# /etc/od-agent-defaults. Hashed into the daemon pod's checksum/agent-defaults annotation.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "open-design.agentDefaultsConfigMapName" . }}
+  labels:
+    {{- include "open-design.labels" . | nindent 4 }}
+data:
+  agent-defaults.py: |
+{{ .Files.Get "files/agent-defaults.py" | indent 4 }}
+  prune-orphan-runs.py: |
+{{ .Files.Get "files/prune-orphan-runs.py" | indent 4 }}
+{{- end }}

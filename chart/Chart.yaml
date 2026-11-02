@@ -1,7 +1,7 @@
 apiVersion: v2
 name: open-design
 description: |
-  OpenDesign cloud service chart (daemon + console).
+  OpenDesign cloud service chart (daemon + console + built-in MCP server + optional Paseo).
 
   A per-instance service running the OpenDesign daemon (nexu-io/open-design):
   the daemon HTTP API on port 7457, state persisted on TWO independent RWO PVCs
@@ -30,7 +30,166 @@ type: application
 # 0.2.1 = the basic-auth username moves into the chart Secret (admin_username); the
 # htpasswd init and the console read it via secretKeyRef, so a username change no
 # longer changes a pod template (it used to time out the 15 s reset and roll back).
-version: 0.2.1
+# 0.2.2 = Omnigent host INSIDE the daemon container (omnigentHost.*, default on; shared kit
+# shared/omnigent-host, vendored byte-identically): the image's ENTRYPOINT (tini →
+# omnigent-host-entry) starts the daemon through the kit's launcher, which runs the
+# supervisor in the background. It waits for the tenant's `omnigent login` in /console/,
+# keeps `omnigent host` connected with a stable name and host id across restarts, stops
+# only on a definitive (twice confirmed) revocation, backs off on 409 with a reset-id hint
+# shown in the /console/ terminal, and refuses a second manual `omnigent host`. No sidecar,
+# no resource split: the daemon keeps its full plan limits; the host tree runs at
+# oom_score_adj 1000 and the kit's memory guard kills a runaway session first.
+# omnigentHost.serverUrl lives only in a runtime ConfigMap (changing it never restarts the
+# pod). Seeds ~/studio (CLAUDE.md, .mcp.json, .claude/settings.json) tracked by a manifest:
+# a deleted file stays deleted, an edited one is never overwritten, CLAUDE.md is updated
+# only while unedited. Daemon hardened (non-root, no priv-esc, drop ALL, RuntimeDefault
+# seccomp), fsGroupChangePolicy OnRootMismatch, telemetry env off.
+# networkPolicy.omnigentEgress: daemon pod → the same-namespace Omnigent SERVER pod :8000
+# only. PLAT-01: the auth proxy adds Cache-Control: no-transform to every response so
+# Cloudflare stops rewriting HTML (e-mail obfuscation broke exported files). Needs an image with the omnigent CLI + omnigent-host-entry (paas-odoo-ci
+# open-design); an older image starts the daemon exactly as before (no host).
+# 0.3.0 = platform #1360: the daemon is a StatefulSet (pod <fullname>-0) so the console
+#         Role pins pods / pods/exec / pods/log to that one pod — the console can no
+#         longer reach the workspace's other services. The auth-proxy htpasswd is a
+#         Secret volume (password resets apply without a daemon restart). Upgrading an
+#         existing instance replaces the Deployment once (~1-2 min, data kept).
+# 0.4.0 = R8 commercial acceptance fixes (platform #1434 #1435 #1437 #1438 #1439 #1440):
+#         agent-defaults initContainer — out-of-the-box default agent (opencode with only an
+#         OpenRouter key, claude with an Anthropic key / claude login; an unusable claude or
+#         amr is replaced, a tenant's own pick kept; a fresh instance skips upstream's
+#         cloud sign-up first-run page) and OpenCode's default model pinned in
+#         opencode.jsonc (agentDefaults.opencodeModel, tenant edits win);
+#         checksum/api-keys rolls the daemon when an LLM key changes (not on a password
+#         reset); ephemeral-storage requests/limits on every container; the Omnigent host
+#         gets the platform's LLM keys (stripApiKeys default false; OD_API_TOKEN still
+#         stripped); auth proxy answers /_woow/support with whiteLabel.supportUrl (the
+#         white-label image patch points "Contact us" there). Upgrading from 0.3.0 rolls
+#         the daemon once; projects and logins on the PVCs are kept.
+# 0.4.1 = 同工作區 LiteLLM 串接（平台注入另案；接在 charts #132 的 0.4.0 之後）：
+#         新 values llmGateway.baseUrl（平台注入 http://<release>-litellm.<ns>.svc.cluster.local:4000/v1，
+#         只帶網址、不帶金鑰；租戶自填的非空值優先）→ daemon 容器（含 /console/ 終端機、Omnigent session）拿到 env LITELLM_BASE_URL，
+#         經不入 checksum 的 runtime ConfigMap <fullname>-llm-gateway（envFrom optional）：
+#         改／清網址 pod template byte-identical、不重啟 pod，密碼重設的 15 秒 atomic
+#         不受影響（tests/test-llm-gateway.sh 鎖住）；執行中的容器下次重啟才看到新值。
+#         不設 OPENAI_BASE_URL／ANTHROPIC_BASE_URL。非 http(s) 網址略過、不讓 render 失敗。
+#         egress：網址非空時才開 daemon → 同 ns LiteLLM proxy pod（name=litellm, component=app）TCP 4000
+#         （networkPolicy.litellmEgress，比照 omnigentEgress）；空值時仍擋。
+# 0.4.2 = platform #1517：auth-proxy 轉發給 daemon（與 /console/ ttyd）的 Host 由 nginx $host
+#         改成客戶端原樣的 $http_host（map $od_upstream_host；沒有 Host header 的 HTTP/1.0 才退回
+#         $host）。$host 會丟掉 port，daemon 用 Host 比對 config.allowedOrigins：網址帶非標準 port
+#         （allowedOrigins 也帶同一個 port）時 GET /api/app-config 回 403，前端接著把空設定
+#         PUT 回去、預設代理 agentId 被清成 null。平台 https 公開網址沒有 port，$http_host 與
+#         $host 相同，行為不變。（主機名稱本身不在 allowedOrigins 時照樣 403——自訂網域仍要
+#         由平台把網域注入 allowedOrigins。）auth-proxy ConfigMap 變更 → checksum/authproxy-config 變，
+#         從 0.4.1 升級 daemon pod 重啟一次（PVC 資料保留）。
+# 0.4.3 = workspace = LAN (woow_paas_platform #1441/#1436): same-namespace egress/ingress on every
+#         port, multicast/240/4 excluded from the internet rule.
+# 0.4.4 = platform #1538：
+#         (1) daemon 有 30 條路由掛 requireLocalDaemonRequest（Host／Origin 都要是 loopback），
+#             經 auth-proxy 一律 403（Remix 靜默變空專案、即時產物預覽、Composio 存金鑰、
+#             匯出診斷日誌、Design Harness、素材庫、記憶連接器）。auth-proxy 新增
+#             authProxy.localRoutes（預設開）：只對網頁會用到的那幾條改送
+#             Host 127.0.0.1:<port>、清掉 Origin；清 Origin 前由 nginx 自己做 CSRF 檢查
+#             （沒有 Origin 或在 config.allowedOrigins 才放行，其他 403），basic auth 照舊。
+#             /api/daemon/shutdown、/api/daemon/db/vacuum 一律 403。Composio 的 OAuth 回呼網址
+#             仍由上游寫死 loopback（要等上游），API key 型連接器可用。
+#         (2) llmGateway.baseUrl 有值時，runtime ConfigMap 另帶 OD_ALLOWED_INTERNAL_HOSTS＝
+#             該網址的主機名稱（只放這一個 FQDN、不放 CIDR；llmGateway.allowInternalHost=false 可關），
+#             daemon 的 SSRF 防護才不會把同工作區 LiteLLM 擋成「Internal IPs blocked」。
+#             與 LITELLM_BASE_URL 同一份不入 checksum 的 ConfigMap：pod template 不變，
+#             執行中的 pod 下次重啟才看到。
+#         auth-proxy ConfigMap 變更 → 從 0.4.3 升級 daemon pod 重啟一次（PVC 資料保留）。
+# 0.4.5 = (woow_paas_platform #1556; 0.4.4 is taken by charts #159) ANTHROPIC_API_KEY / OPENROUTER_API_KEY are ALWAYS
+#         rendered in the chart Secret, "" when unset. Written only when set, a key the
+#         tenant cleared (platform clear_keys) left stringData but never the data key
+#         Kubernetes had merged it into (helm three-way patch) — the daemon kept the OLD
+#         key after the restart. "" clears it (agent-defaults.py and the CLIs treat ""
+#         as no key); open-design.apiKeysChecksum still rolls the daemon on set / clear,
+#         and gains a constant ("keys-always-rendered") so the upgrade to this version
+#         restarts the daemon once — a key stuck since an earlier clear leaves the
+#         running process too.
+# 0.5.0 = built-in OpenDesign MCP server (platform od-mcp-merge-20261015; replaces the
+#         mcp-opendesign template). mcp.* (default enabled=false): sidecar `mcp` in the daemon
+#         pod (same image, /opt/woow/bin/paas-opendesign-mcp = the HA add-on's MCP runtime,
+#         uid/gid 10001, read-only root FS, no secrets, no probes), state on the od-data PVC
+#         subPath mcp.dataSubPath, emptyDir od-mcp-run (admin.sock) mounted ONLY by mcp and
+#         authproxy. auth-proxy: /mcp (Bearer) and /private_<token>/mcp (Claude.ai, access_log
+#         off) → 127.0.0.1:<mcp.port> without basic-auth; /mcp-admin/ behind basic-auth →
+#         admin.sock with X-Remote-User-Id $remote_user. mcp.enabled=false renders exactly as
+#         0.4.5; the platform enables it in the same seed change as an image with the runtime.
+#         omnigentHost.enabled now defaults to false (Omnigent paused on the PaaS, owner decision
+#         2026-10-15): no kit ConfigMaps / OG_* env / mounts / NetworkPolicy hole. A
+#         --reuse-values release without the key still counts as enabled (shared kit contract),
+#         so the platform passes omnigentHost.enabled=false explicitly.
+# 0.5.1 = commercial acceptance AI-OD fixes (AI-FIX-OD-1; defects AI-OD-007-4 / -6, AI-OD-004-1,
+#         update footprint AI-OD-005-1):
+#         (1) console container no longer root with the default capability set: uid/gid
+#             console.runAsUser (10002), drop ALL, no privilege escalation, RuntimeDefault seccomp,
+#             read-only root fs (emptyDir /app and /tmp, HOME=/tmp); baked image only —
+#             console.runtimeInstall keeps its old spec;
+#         (2) auth-proxy sidecar and its htpasswd init container get a securityContext
+#             (uid 101, non-root, drop ALL, no privilege escalation, RuntimeDefault);
+#         (3) pod-level seccomp RuntimeDefault (also covers seed-home), defaulted in the helper so a
+#             --reuse-values upgrade gets it too;
+#         (4) `prune-runs` initContainer (runsPrune.*, default on): removes run records
+#             (<data>/runs/<id>) of projects that no longer exist — the daemon never deletes them and
+#             keeps the user's prompts readable via /api/runs after the project was deleted; fail-safe,
+#             counts only (files/prune-orphan-runs.py; the runtime half is an upstream daemon fix);
+#         (5) agent-defaults: when the OpenRouter key the chart switched the default agent to
+#             opencode for is cleared again, claude (the upstream default) is put back.
+#         Upgrading from 0.5.0 rolls the daemon pod once (PVC data kept) and the console once
+#         (Recreate, stateless). No new PVC, no resource change: ResourceQuota is unaffected
+#         (the new init container's limits are below the pod's container sum).
+# 0.5.2 = AI-FIX-SEC-1 (#1457): the auth-proxy locks out a client IP after 10 wrong logins (429 + Retry-After 300 s,
+# per client IP via CF-Connecting-IP, never per account), adds HSTS / nosniff / X-Frame-Options SAMEORIGIN / CSP frame-ancestors /
+# Referrer-Policy / Permissions-Policy (an upstream header wins), hides X-Powered-By and the nginx version. Shared helper
+# templates/_authproxy-guard.tpl (shared/authproxy-guard); authProxy.guard.* tunes or disables it. Anonymous /api/health|ready|version now return a bare {"ok":true}
+# (AI-OD-007-3); a caller with credentials still gets the daemon JSON. Stacked on 0.5.1 (woow-paas-charts#203).
+# 0.5.3 = console-ttyd-exposure (AI-HER-006-4 / X-SEC-002-1 / X-SEC-005-4): the admin password no longer reaches an
+#         argv or the pod log — ttyd listens on loopback only (-i lo, CONSOLE_TTYD_INTERNAL_PORT, default
+#         service.ttydPort+1) with a random per-boot credential; the public :7681 is a Basic front inside
+#         entrypoint.py (`entrypoint.py authfront`) that checks admin_password from the environment and forwards to
+#         ttyd with ttyd's own credential (was `ttyd -c admin:<password>`: /proc/<pid>/cmdline + `credential:
+#         <base64>` in the log). Service / NetworkPolicy / auth-proxy route unchanged, same 401 + Basic challenge
+#         (authproxy-guard lockout still counts it). The console Role loses secrets get/patch/update (unused).
+#         Both console modes (baked, runtimeInstall). Upgrade rolls the console pod once; the daemon is untouched.
+#         Stacked on 0.5.2 (woow-paas-charts#213, itself on #203).
+# 0.5.4 = sensitive-data-in-logs (X-SEC-002): auth-proxy access log without query strings / MCP tokens.
+#         Stacked on 0.5.3 (woow-paas-charts#233).
+# 0.5.5 = AI-FIX-OD-1-1: the daemon's securityContext (open-design.containerSecurityContext, also used by the
+#         agent-defaults / prune-runs init containers) sets the tenant/platform keys one by one over the
+#         hardened defaults, like the console and auth-proxy helpers since 0.5.1. It used sprig's merge,
+#         which treats `false` as empty: `securityContext.runAsNonRoot: false` (or any other key whose
+#         default is true) rendered the default. With default values the output equals 0.5.4 except the
+#         helm.sh/chart label (the pods roll once on the upgrade, as for every chart bump; data
+#         kept, no resource change). Stacked on 0.5.4 (woow-paas-charts#235).
+# 0.5.6 = 商用驗收 egress-all-ports-open（AI-HER-008-2、AI-OD-007-9）: the daemon StatefulSet pod (and the console only with console.runtimeInstall) carry
+#         paas.woowtech.io/egress-profile=web (networkPolicy.egressProfile, default "web";
+#         "" or networkPolicy.enabled=false → no label). The platform baseline egress
+#         (paas-baseline-egress, podSelector {}) allows the internet on ANY port and NPs are a
+#         union, so this chart's 80/443 internet limit had no effect. Once the operator runs with
+#         TENANT_BASELINE_EGRESS_WEB_PROFILE=true (woow_paas_platform #1802), labelled pods move to
+#         paas-baseline-egress-web (same ns + DNS + internet TCP 80/443). Operator flag off → just
+#         a pod label (the pod rolls once on upgrade), no traffic change. Renumbered 0.5.5 → 0.5.6 in the
+#         2026-10-18 bundle (0.5.5 = charts#253 daemon securityContext; this is charts#247).
+# 0.5.7 = /terminal and /terminal/… answer 301 <console.externalPath>/ (default /console/), the
+#         terminal path the Home Assistant build of the same image used before both moved to
+#         /console/; OpenDesign's built-in "CLI Terminal" plugin opens /console/. Config-only
+#         (the auth-proxy ConfigMap; nginx reloads with the pod roll of a chart bump).
+# 0.5.8 = optional native Paseo app (paseo.enabled, default false): a supervised child
+#         in the open-design container shares /proc identity with stdio MCP, preserves
+#         the image ENTRYPOINT and original OD argv, and reuses the data/home PVCs.
+#         Basic-authenticated /paseo/setup[/], /paseo/assets/* and /api/paseo-bridge
+#         proxy to loopback :7460; requires the compatible pinned optional image.
+#         authproxy http always sets map_hash_bucket_size 512, allowing long public
+#         origins with Paseo enabled or disabled. Includes real Nginx startup regressions.
+#         Use stable chart versions until platform prerelease metadata parsing is fixed;
+#         deployment pins and the observed parsing issue are in PASEO-DEPLOYMENT.md.
+# 0.5.9 — promote native Paseo source onto current main without replacing 0.5.8;
+#         runtime contract unchanged, release documentation and CI coverage updated.
+# 0.5.10 — Console terminal iframe respects ttyd's configured base path;
+#          document daemon-owned Omnigent setup separately from the legacy host kit.
+version: 0.5.10
 # appVersion tracks the upstream OpenDesign release (nexu-io/open-design).
 # The platform pins the real image tag@digest via helm_default_values.
 appVersion: "0.24.1"
