@@ -8,7 +8,7 @@
 # Installs the HA add-on's runtime (ha/, a pinned copy of WOOWTECH/Woow_ha_opendesign_add_on mcp-runtime, see
 # HA_SOURCE.json) exactly as the add-on's own install.sh lays it out — /opt/woow = the vendored Woow_ha_mcp_addons
 # tree + ha_opendesign_mcp, venvs on the core image's /usr/bin/python3 with ONLY the add-on's hash-pinned wheels —
-# plus the PaaS placement (paas_opendesign_mcp, bin/paas-opendesign-mcp).
+# plus the PaaS placement/input overlay (paas_opendesign_mcp, bin/paas-opendesign-mcp).
 #
 # Principal: mcp (uid/gid 10001), the user of the chart's `mcp` container. The daemon user (open-design, 1001) never
 # belongs to its group. Unlike the add-on there is no ha-ingress user (nginx runs in its own container) and no root
@@ -100,4 +100,8 @@ assert len(launch.mcp._tool_manager.list_tools()) == 15
 # and pinned packages (loopback fake daemon, no network) — the same run the add-on's install.sh does.
 HA_OD_MCP_CODE="$root" HA_OD_MCP_VENDOR="$root" sh "$ha/tests/unit/run.sh" "$root/.venv/bin/python" \
   "$root/apps/opendesign/.venv/bin/python"
+# PaaS-only 0.2.15 input overlay: exact gateway schemas and child guards on a
+# disposable loopback daemon. Neither test contacts the installed OD daemon.
+PAAS_MCP_ROOT="$root" "$root/.venv/bin/python" -B "$src/tests/test_paas_gateway_contract.py"
+PAAS_MCP_ROOT="$root" "$root/apps/opendesign/.venv/bin/python" -B "$src/tests/test_paas_child_contract.py"
 echo "built-in MCP installed: HA runtime $(sed -n 's/.*"source_commit": "\([0-9a-f]*\)".*/\1/p' "$src/HA_SOURCE.json" | head -n1), vendored Woow_ha_mcp_addons $(sed -n 's/.*"source_commit": "\([0-9a-f]*\)".*/\1/p' "$ha/VENDOR.json")"

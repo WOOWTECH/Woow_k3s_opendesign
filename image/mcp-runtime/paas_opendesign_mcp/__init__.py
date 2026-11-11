@@ -1,9 +1,8 @@
 """PaaS placement of the HA add-on's built-in OpenDesign MCP runtime (chart open-design >= 0.5.0, `mcp` container).
 
-The MCP runtime itself — the pinned Woow MCP gateway, the OpenDesign tools, the tool surface, its defaults and
-protections, the admin page — is the HA add-on's (../ha/, a pinned copy of WOOWTECH/Woow_ha_opendesign_add_on
-mcp-runtime, ../HA_SOURCE.json), used unchanged so both products behave the same. This package only places it in the
-PaaS pod (launch.py):
+The MCP runtime source — the pinned Woow MCP gateway, OpenDesign tools, default grants, protections and admin page —
+is the HA add-on's (../ha/, pinned in ../HA_SOURCE.json) and stays byte-for-byte unchanged. This package places it in
+the PaaS pod and overlays six input models with matching child guards to align the HA 0.2.15 input contract:
 
 * the runtime runs in its own sidecar container of the daemon pod as uid/gid 10001, started directly by Kubernetes:
   no root bootstrap and no privilege drop (bin/paas-opendesign-mcp replaces the add-on's bin/ha-opendesign-mcp);
