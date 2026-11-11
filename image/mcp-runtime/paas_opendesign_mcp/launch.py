@@ -1,16 +1,18 @@
-"""Run the HA add-on's built-in MCP runtime (ha_opendesign_mcp.runtime, ../ha/) at the PaaS placement.
+"""Run the pinned HA built-in MCP runtime at the PaaS placement.
 
-Nothing of the runtime is re-implemented here. The add-on's package keeps its placement in module constants
+The add-on's package keeps its placement in module constants
 (ha_opendesign_mcp/__init__.py: BACKEND_URL, DATA_DIR, RUN_DIR, ADMIN_SOCKET, CHILD_SOCKET, MCP_HOST, MCP_PORT);
 place() imports the runtime, replaces exactly those constants in every loaded ha_opendesign_mcp module with the PaaS
-values (paas_opendesign_mcp/__init__.py), and adds one PaaS step to the add-on's start: the admin page's client
-endpoint is seeded with <public origin>/mcp while it is unset. Then the add-on's runtime main() runs unchanged: the
-same gateway, tool surface, default grants, protections, admin page and state handling as the HA add-on.
+values (paas_opendesign_mcp/__init__.py), seeds the admin page's client endpoint
+while unset, and overlays only six argument models to match HA 0.2.15. The
+private child entry applies corresponding ID/path guards before HA's startup.
+The pinned files and HA_SOURCE.json are unchanged.
 
 A re-sync of ../ha/ that renames or removes one of those constants, or pin_backend(), refuses to start (RuntimeError)
 until this file is reviewed against it.
 """
 import sys
+from pathlib import Path
 
 from . import ADMIN_SOCKET, CHILD_SOCKET, DATA_DIR, MCP_HOST, RUN_DIR, settings
 
@@ -36,6 +38,12 @@ def place(config):
             for key, value in values.items():
                 if key in vars(module):
                     setattr(module, key, value)
+    from . import input_contract
+    input_contract.install()
+    expected_child = Path(runtime.__file__).with_name('child.py')
+    if getattr(runtime, 'CHILD_ENTRY', None) != expected_child:
+        raise RuntimeError('HA child entry changed; review PaaS input overlay')
+    runtime.CHILD_ENTRY = Path(__file__).with_name('child.py')
     if not callable(getattr(runtime, 'pin_backend', None)):
         raise RuntimeError('HA runtime pin_backend() changed; review endpoint seeding')
     endpoint = config['endpoint']
