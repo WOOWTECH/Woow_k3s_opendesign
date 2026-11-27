@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.2.1 — resync (2026-11-28)
+
+- `image/` → **Agent Connect 0.3.1** (build only). `node-pty` is now compiled for musl against the Node headers that
+  ship in the core image (`npm_config_nodedir`) instead of headers downloaded from unofficial-builds.nodejs.org, whose
+  connect from Asia races Node's 250 ms per-address attempt and failed image builds at random with
+  `NATIVE_NODE_PTY_BUILD_FAILED` (seen on fresh Podman installs). A failed rebuild keeps npm's own error in the log.
+  Paseo stays **0.17.5** and the runtime revision stays `0.17.5-r2-186f173be43b`. Source: the public `v0.3.1` release of
+  `WOOWTECH/opendesign-paseo-plugin` (`6e0add40`), vendored by `woow-paas/paas-odoo-ci`. The core is unchanged
+  (`woow-od-v0.24.1-w2.11`).
+- `chart/` (**0.5.10**) and `console/` are unchanged.
+
 ## 3.2.0 — resync (2026-11-27)
 
 - `image/` → **Agent Connect 0.3.0** (was the Paseo plugin 0.2.3 on Paseo 0.11.2): the shell now bakes the managed
