@@ -58,6 +58,7 @@ COPY mcp-runtime/ /tmp/mcp-runtime/
 # Same public, lock-pinned Paseo runtime as the HA shell. The native launcher and
 # atomic MCP API are compiled in the shared core; the chart owns supervision.
 COPY paseo-runtime/ /opt/opendesign-paseo/
+COPY paseo-runtime/launcher/open-design.json paseo-runtime/launcher/SKILL.md /app/plugins/_official/woow/woow-paseo/
 RUN sh /tmp/mcp-runtime/install.sh && rm -rf /tmp/mcp-runtime \
     && cd /opt/opendesign-paseo \
     && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
