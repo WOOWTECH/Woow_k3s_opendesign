@@ -11,7 +11,7 @@ const local = process.env.SMOKE_LOCAL === '1';
 const host = process.env.SMOKE_HOST_ROOT || '/opt/opendesign-paseo';
 const bundled = process.env.SMOKE_EXPECT_BUNDLED || `${host}/managed-runtime`;
 const {createStandaloneApp, standaloneConfig} = await import(`${host}/host/standalone.mjs`);
-const {runtimeReady, runtimeDirectory, RUNTIME_REVISION} = await import(`${host}/vendor/pi-paseo/src/runtime-layout.mjs`);
+const {runtimeReady, runtimeDirectory, RUNTIME_REVISION, PASEO_VERSION} = await import(`${host}/vendor/pi-paseo/src/runtime-layout.mjs`);
 
 if (!local) assert.equal(process.getuid(), 1001);
 const dataDir = process.env.OD_DATA_DIR;
@@ -60,7 +60,7 @@ try {
 
   // 4. Running, from the baked runtime, without having installed or downloaded anything.
   assert.equal(status.installed, true);
-  assert.equal(status.version, '0.11.2');
+  assert.equal(status.version, PASEO_VERSION);
   assert.equal(status.daemon.owned, true);
   assert.equal(status.daemon.reachable, true);
   const state = JSON.parse(fs.readFileSync(path.join(dataDir, 'paseo/state.json'), 'utf8'));

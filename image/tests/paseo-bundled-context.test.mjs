@@ -5,8 +5,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { runtimeContext } from '../paseo-runtime/src/runtime-context.mjs';
-import { prepareRuntimeManifest, markRuntimeReady, runtimeReady, runtimeDirectory } from '../paseo-runtime/vendor/pi-paseo/src/runtime-layout.mjs';
+import { prepareRuntimeManifest, markRuntimeReady, runtimeReady, runtimeDirectory, PASEO_VERSION } from '../paseo-runtime/vendor/pi-paseo/src/runtime-layout.mjs';
 
 function tenant(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'od-bundled-')), home = path.join(root, 'home'), dataDir = path.join(root, 'data');
@@ -20,7 +21,11 @@ function bake(directory) {
   const loc = { runtimeDir: directory };
   const release = prepareRuntimeManifest(loc);
   fs.mkdirSync(path.join(release, 'node_modules/@getpaseo/cli'), { recursive: true });
-  fs.writeFileSync(path.join(release, 'node_modules/@getpaseo/cli/package.json'), JSON.stringify({ name: '@getpaseo/cli', version: '0.11.2' }));
+  fs.writeFileSync(path.join(release, 'node_modules/@getpaseo/cli/package.json'), JSON.stringify({ name: '@getpaseo/cli', version: PASEO_VERSION }));
+  const server = path.join(release, 'node_modules/@getpaseo/server/dist/server/server/websocket-server.js');
+  fs.mkdirSync(path.dirname(server), { recursive: true });
+  // Exact Apache-2.0 @getpaseo/server fixture; LICENSE and NOTICE travel beside it.
+  fs.writeFileSync(server, zlib.gunzipSync(fs.readFileSync(new URL('fixtures/getpaseo-server-0.17.5-websocket-server.js.gz', import.meta.url))));
   markRuntimeReady(loc);
   assert.equal(runtimeReady(loc), true);
   return loc;
