@@ -12,7 +12,7 @@ changes are reviewed and approved there, then synced here with
 
 | Directory | Contents |
 |---|---|
-| [`image/`](image/) | OpenDesign daemon image — the PaaS shell on `open-design-core` (built from the Woow fork `woow-od-v0.24.1-w2.11`, OpenDesign **0.24.1**) + Claude Code **2.1.296**, Codex **0.162.1**, Pi **1.1.0**, OpenCode **1.18.33**, Omnigent **0.16.0**, with build-time version contracts |
+| [`image/`](image/) | OpenDesign daemon image — the PaaS shell on `open-design-core` (built from the Woow fork `woow-od-v0.24.1-w2.11`, OpenDesign **0.24.1**) + Claude Code **2.1.296**, Codex **0.162.1**, Pi **1.1.0**, OpenCode **1.18.33**, Omnigent **0.16.0**, with build-time version contracts; Agent Connect **0.3.0** with the managed official Paseo **0.17.5** runtime built in |
 | [`console/`](console/) | Console image — ttyd web terminal + Flask dashboard |
 | [`chart/`](chart/) | Per-tenant Helm chart **0.5.10** installed by the PaaS operator |
 

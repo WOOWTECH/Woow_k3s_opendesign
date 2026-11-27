@@ -254,19 +254,17 @@ Gitea 現有 `build` job 的 `needs: [gate]` 保留，避免無關 issue comment
 
 ### Native Paseo packaging
 
-The w2.5 fork compiles the native Paseo launcher and atomic MCP server API into
-`open-design-core`. Both the PaaS shell and HA add-on install the public shared
-`opendesign-paseo-plugin` runtime 0.2.3 at commit
-`56fcee82d610b56d5263e88cff04f9ece602a9ef` (the HA add-on follows with 0.2.11).
-PaaS vendors the npm package plus its lockfile under `paseo-runtime/`; the
-directory is byte-identical to the published v0.2.3 release (no local patch), and
-`SOURCE.json` records the archive and file hashes. 0.2.3 adds the managed runtime
-support baked into this image (#448), local speech off for new daemon homes, the
-provider home directories (`.codex`, `.claude`, `.pi/agent`) created when the
-runtime context is built, and one catalog refresh for a provider whose model list
-was cached empty or failed.
-Run `python3 scripts/verify-open-design-paseo.py` from the repository root to
-verify the vendored source.
+The w2.11 fork compiles the native Paseo launcher and atomic MCP server API into
+`open-design-core`. This tree vendors the published `opendesign-paseo-plugin`
+v0.3.0 release (Agent Connect on Paseo 0.17.5) from merged commit
+`fa9e28bc785f11f24563b2740c3ae65f42d65210`. PaaS copies the release's npm archive
+plus its exact root lockfile under `paseo-runtime/`; `SOURCE.json` records the
+commit, archive digest and every vendored file digest, and is written by
+`scripts/sync-open-design-paseo.py 0.3.0`. The release keeps the managed-runtime
+behavior from #448 and adds Agent Connect. Run
+`python3 scripts/verify-open-design-paseo.py` from the repository root to verify
+the vendored source, and add `--release` (needs network) to also compare it with
+the published GitHub release.
 
 The chart (0.5.9 or later) starts the bridge inside the OpenDesign container when
 `paseo.enabled` is set, supplies the canonical HTTPS origin and proxies the
@@ -277,7 +275,7 @@ gate run `tests/paseo-image-smoke.mjs` against the actual compiled daemon as UID
 preservation, setup page and cross-origin rejection. These checks make no model
 calls. Live HA/PaaS acceptance and immutable image pins are recorded separately.
 
-**First activation contract (#448).** The managed `@getpaseo/cli` runtime (lock-pinned, `0.11.2`) is built into the PaaS
+**First activation contract (#448).** The managed `@getpaseo/cli` runtime (lock-pinned, `0.17.5`) is built into the PaaS
 shell at `/opt/opendesign-paseo/managed-runtime` (`Dockerfile`, stage `paseo-runtime`, using the package's own
 `runtime-layout` so the release path, lock hash and receipt are what the host verifies). The host package uses it in place,
 read-only, once the receipt matches its lock: enabling Paseo runs **no `npm`**, needs **no registry access** and writes

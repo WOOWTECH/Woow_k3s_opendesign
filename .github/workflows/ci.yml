@@ -91,5 +91,20 @@ jobs:
           context: ${{ matrix.context }}
           build-args: ${{ matrix.core && format('CORE={0}', env.OD_CORE) || '' }}
           platforms: linux/amd64
+          # The daemon candidate is loaded only for the isolated runtime smoke below.
+          # Mirror CI still never publishes an image.
+          load: ${{ matrix.name == 'daemon' }}
           push: false
           tags: woow-open-design-${{ matrix.name }}:ci
+      - name: Offline Agent Connect managed-runtime smoke
+        if: matrix.name == 'daemon'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          docker run --rm --platform linux/amd64 \
+            --network none \
+            --user 1001:1001 \
+            --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g,uid=1001,gid=1001,mode=0700 \
+            woow-open-design-daemon:ci \
+            node /opt/opendesign-paseo/scripts/smoke-managed-runtime.mjs

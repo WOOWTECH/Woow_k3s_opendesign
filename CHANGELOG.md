@@ -1,5 +1,21 @@
 # Changelog
 
+## 3.2.0 — resync (2026-11-27)
+
+- `image/` → **Agent Connect 0.3.0** (was the Paseo plugin 0.2.3 on Paseo 0.11.2): the shell now bakes the managed
+  official Paseo **0.17.5** runtime into `/opt/opendesign-paseo/managed-runtime` (runtime revision
+  `0.17.5-r2-186f173be43b`; `node-pty` is rebuilt for musl and a real PTY spawn is checked before the ready receipt), so a
+  new service starts Agent Connect without npm or network. The plugin card, setup page and guide are renamed
+  **Agent Connect**; the plugin id `woow-paseo`, the path `/paseo/setup/` and the provider homes are unchanged. Pairing
+  offers three client targets: the official Paseo app (`app.paseo.sh`), Woowtech Smart (`smart.woowtech.io`) and Apporo
+  Smart (`smart.apporo.ai`). Source: the public `v0.3.0` release of `WOOWTECH/opendesign-paseo-plugin`
+  (`fa9e28bc`), vendored by `woow-paas/paas-odoo-ci`. The core is unchanged (`woow-od-v0.24.1-w2.11`).
+- `chart/` is unchanged (**0.5.10**); a stray `__pycache__/paseo-launch.cpython-311.pyc` that the 3.1.0 sync copied
+  from a local checkout is gone. `console/` is unchanged.
+- CI: the daemon image is loaded after the build and runs the offline Agent Connect managed-runtime smoke
+  (`--network none`, read-only root, UID 1001). Mirror CI still never publishes an image.
+- Sources: `woow-paas/paas-odoo-ci` and `woow-paas/woow-paas-charts` commits are in [MIRROR.md](MIRROR.md).
+
 ## 3.1.0 — resync (2026-11-02)
 
 - `chart/` → **0.5.10** (was 0.2.1): Paseo, Omnigent host, built-in MCP sidecar, LLM gateway, agent defaults,
