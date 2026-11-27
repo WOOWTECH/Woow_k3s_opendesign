@@ -28,18 +28,19 @@ RUN /usr/local/bin/npm ci --include=dev --ignore-scripts --no-audit --no-fund \
 # runtime that used to run npm. Nothing is written to the tenant volumes and nothing is downloaded at container start.
 FROM ${CORE} AS paseo-runtime
 USER root
-COPY paseo-runtime/vendor/pi-paseo/ /opt/pi-paseo/
+RUN apk add --no-cache python3 libstdc++ \
+    && apk add --no-cache --virtual .agent-connect-build build-base
+COPY paseo-runtime/ /opt/opendesign-paseo/
 # The @getpaseo/* npm packages carry no LICENSE file; Paseo is Apache-2.0 (github.com/getpaseo/paseo, no NOTICE), so the
 # text travels with the runtime now that the image redistributes it (Apache-2.0 section 4(a)).
 COPY paseo-legal/getpaseo-Apache-2.0.txt /opt/opendesign-paseo/managed-runtime/LICENSES/getpaseo-Apache-2.0.txt
 RUN set -eu; \
     export npm_config_cache=/tmp/npm-cache; \
-    ROOT=$(node --input-type=module -e 'import {prepareRuntimeManifest} from "/opt/pi-paseo/src/runtime-layout.mjs"; console.log(prepareRuntimeManifest({runtimeDir:"/opt/opendesign-paseo/managed-runtime"}))'); \
-    npm ci --prefix "$ROOT" --omit=dev --no-audit --no-fund; \
-    test "$(node "$ROOT/node_modules/@getpaseo/cli/bin/paseo" --version)" = 0.11.2; \
-    test -s "$ROOT/node_modules/@getpaseo/server/dist/server/web-ui/index.html"; \
-    node --input-type=module -e 'import {markRuntimeReady,runtimeReady} from "/opt/pi-paseo/src/runtime-layout.mjs"; const loc={runtimeDir:"/opt/opendesign-paseo/managed-runtime"}; markRuntimeReady(loc); if(!runtimeReady(loc)) process.exit(1)'; \
+    cd /opt/opendesign-paseo; \
+    npm ci --omit=dev --ignore-scripts --no-audit --no-fund; \
+    node scripts/prepare-managed-runtime.mjs /opt/opendesign-paseo/managed-runtime; \
     chmod -R a+rX,go-w /opt/opendesign-paseo/managed-runtime; \
+    apk del .agent-connect-build; \
     rm -rf /tmp/npm-cache /root/.npm
 
 FROM ${CORE} AS shell-base
