@@ -27,7 +27,7 @@
 | Codex | **0.162.1** |
 | Pi | **1.1.0** |
 | OpenCode | **1.18.33** |
-| Agent Connect | **0.3.0**（內建官方 Paseo **0.17.5** runtime，可連官方 Paseo、Woowtech Smart、Apporo Smart） |
+| Agent Connect | **0.3.1**（內建官方 Paseo **0.17.5** runtime，可連官方 Paseo、Woowtech Smart、Apporo Smart） |
 | Chart | **0.5.10** |
 
 核心（`image/Dockerfile.core`）最後一步是 build 時的檢查：Claude Code、Codex、Pi 與 OpenCode 版本必須完全相符、
