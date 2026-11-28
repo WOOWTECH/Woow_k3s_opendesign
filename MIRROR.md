@@ -14,11 +14,11 @@ overwrites them. Open the change against the Gitea repository instead.
 <!-- BEGIN GENERATED: scripts/sync-from-gitea.sh -->
 | Mirror path | Source repository | Source path | Commit |
 |---|---|---|---|
-| `image/` | `woow-paas/paas-odoo-ci` | `open-design/` | `3e901d60137b48be1186427281fef8de91a26560` |
-| `console/` | `woow-paas/paas-odoo-ci` | `open-design-console/` | `3e901d60137b48be1186427281fef8de91a26560` |
+| `image/` | `woow-paas/paas-odoo-ci` | `open-design/` | `3c10340e17e3d6429d2a0313710250a9770fbee0` |
+| `console/` | `woow-paas/paas-odoo-ci` | `open-design-console/` | `3c10340e17e3d6429d2a0313710250a9770fbee0` |
 | `chart/` | `woow-paas/woow-paas-charts` | `charts/open-design/` | `e697593939911b904ec060c2ca9b800b092cf102` |
 
-Chart `0.5.10` / OpenDesign `0.24.1` — synced 2026-11-27 20:44 UTC.
+Chart `0.5.10` / OpenDesign `0.24.1` — synced 2026-11-28 00:35 UTC.
 <!-- END GENERATED -->
 
 ## What each directory is
